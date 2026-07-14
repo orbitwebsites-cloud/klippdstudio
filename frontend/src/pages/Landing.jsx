@@ -130,12 +130,6 @@ export default function Landing({ keysStatus, backendOnline, onOpenSettings }) {
 
     return (
         <div className="min-h-[calc(100vh-72px)]" data-testid="landing-page">
-            {backendOnline === false && (
-                <div className="mx-4 md:mx-16 mt-5 border border-[#ff3333]/40 bg-[#ff3333]/10 px-4 py-3 flex items-center gap-3 text-sm" role="alert">
-                    <WifiOff className="w-4 h-4 text-[#ff5a5a] flex-shrink-0" />
-                    <span className="text-white/80">The editing server is offline. You can browse projects, but uploads and renders need the backend connected.</span>
-                </div>
-            )}
             {/* Marquee band */}
             <div className="overflow-hidden border-b border-white/10 py-2">
                 <div className="marquee">

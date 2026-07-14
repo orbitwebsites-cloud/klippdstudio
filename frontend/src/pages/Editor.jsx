@@ -437,7 +437,7 @@ export default function Editor() {
 
                     <div className="panel p-6">
                         <div className="font-mono text-xs text-white/40 tracking-widest mb-3">// STYLE</div>
-                        <div className="grid grid-cols-3 gap-2">
+                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
                             <button
                                 className={`style-pill ${style === "tiktok" ? "active-tiktok" : ""}`}
                                 onClick={() => setStyle("tiktok")}
@@ -453,7 +453,7 @@ export default function Editor() {
                                 YOUTUBE
                             </button>
                             <button
-                                className={`style-pill ${style === "luxury" ? "border-[#d4af37] text-[#d4af37]" : ""}`}
+                                className={`style-pill col-span-2 sm:col-span-1 ${style === "luxury" ? "active-luxury" : ""}`}
                                 onClick={() => setStyle("luxury")}
                                 data-testid="style-luxury"
                             >

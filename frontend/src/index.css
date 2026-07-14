@@ -214,7 +214,7 @@ input:focus-visible {
   letter-spacing: 0.08em;
   text-transform: uppercase;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: color 0.2s, background-color 0.2s, border-color 0.2s, transform 0.2s;
   background: transparent;
   color: var(--text-muted);
 }
@@ -227,6 +227,11 @@ input:focus-visible {
   background: var(--youtube);
   color: #fff;
   border-color: var(--youtube);
+}
+.style-pill.active-luxury {
+  background: #d4af37;
+  color: #050505;
+  border-color: #d4af37;
 }
 
 /* Loading kinetic text */
