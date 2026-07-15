@@ -117,7 +117,16 @@ jobs:
           docker rm -f klippd-backend 2>/dev/null || true
           docker build -f /opt/klippdstudio/backend/Dockerfile -t klippd-backend /opt/klippdstudio
           docker run -d --name klippd-backend --restart unless-stopped --env-file /opt/klippd/klippd.env -v /opt/klippd/data:/app/data -p 8000:8000 klippd-backend
+          for attempt in {1..24}; do
+            if curl --fail --silent --show-error http://127.0.0.1:8000/api/health; then
+              exit 0
+            fi
+            sleep 5
+          done
+          docker ps -a
+          docker logs --tail 200 klippd-backend || true
+          exit 1
           REMOTE
           rm -f /tmp/klippd.env /tmp/klippdstudio.tar.gz
       - name: Verify health endpoint
-        run: curl --fail --retry 12 --retry-delay 5 "http://${{ steps.host.outputs.ip }}:8000/api/health"
+        run: curl --fail --retry 12 --retry-connrefused --retry-delay 5 "http://${{ steps.host.outputs.ip }}:8000/api/health"
