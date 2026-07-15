@@ -62,6 +62,8 @@ export default function Editor() {
     const navigate = useNavigate();
     const location = useLocation();
     const [project, setProject] = useState(null);
+    const projectId = project?.id;
+    const projectStatus = project?.status;
     const [style, setStyle] = useState("tiktok");
     const [aspect, setAspect] = useState("16:9");
     const [renderOpts, setRenderOpts] = useState({
@@ -184,22 +186,22 @@ export default function Editor() {
     }, [project, draftLoadedFor]);
 
     useEffect(() => {
-        if (!project || !["ready", "done"].includes(project.status)) return;
+        if (!projectStatus || !["ready", "done"].includes(projectStatus)) return;
         try {
             if (window.sessionStorage.getItem(`klippd_settings_cue_${id}`) === "1") {
                 setShowSettingsCue(true);
             }
         } catch { /* The cue is non-essential. */ }
-    }, [id, project?.status]);
+    }, [id, projectStatus]);
 
     useEffect(() => {
-        if (!project || draftLoadedFor !== project.id) return undefined;
+        if (!projectId || draftLoadedFor !== projectId) return undefined;
         const timer = window.setTimeout(() => {
             saveEditOptions(id, { style, aspect, ...renderOpts })
                 .catch(() => toast.error("Could not save edit settings. Try again before rendering."));
         }, 500);
         return () => window.clearTimeout(timer);
-    }, [id, project?.id, draftLoadedFor, style, aspect, renderOpts]);
+    }, [id, projectId, draftLoadedFor, style, aspect, renderOpts]);
 
     const effectiveFillers = useMemo(() => {
         const s = new Set(autoFillers);
