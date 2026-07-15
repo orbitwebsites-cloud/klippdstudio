@@ -1,6 +1,6 @@
 # DigitalOcean deployment
 
-Run the `Deploy backend to DigitalOcean` workflow manually from GitHub Actions. The first run creates a `s-2vcpu-4gb` Ubuntu Droplet, uploads the backend configuration, and runs the FastAPI/FFmpeg image. Future runs reuse the same named Droplet and redeploy the latest `main` branch.
+Run the `Deploy backend to DigitalOcean` workflow manually from GitHub Actions. The first run creates a `s-2vcpu-4gb` Ubuntu Droplet, uploads the checked-out repository source and backend configuration, and runs the FastAPI/FFmpeg image. Future runs reuse the same named Droplet and redeploy the latest `main` branch.
 
 Required repository secrets:
 
