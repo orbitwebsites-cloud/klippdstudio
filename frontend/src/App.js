@@ -2,46 +2,33 @@ import { useEffect, useState } from "react";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { Toaster } from "sonner";
 import TopBar from "@/components/TopBar";
-import SettingsModal from "@/components/SettingsModal";
 import Landing from "@/pages/Landing";
 import Editor from "@/pages/Editor";
 import TrainingLab from "@/pages/TrainingLab";
-import { getKeysStatus } from "@/lib/klipApi";
+import { getHealth } from "@/lib/klipApi";
 import "@/App.css";
 
 function App() {
-    const [settingsOpen, setSettingsOpen] = useState(false);
-    const [keysStatus, setKeysStatus] = useState({
-        groq: false, cerebras: false,
-    });
     const [backendOnline, setBackendOnline] = useState(null);
 
-    const refreshKeys = () => {
-        getKeysStatus()
-            .then((status) => {
-                setKeysStatus(status);
-                setBackendOnline(true);
-            })
+    const refreshBackend = () => {
+        getHealth()
+            .then(() => setBackendOnline(true))
             .catch(() => setBackendOnline(false));
     };
 
-    useEffect(() => { refreshKeys(); }, []);
+    useEffect(() => { refreshBackend(); }, []);
 
     return (
         <BrowserRouter>
-            <TopBar keysStatus={keysStatus} backendOnline={backendOnline} onOpenSettings={() => setSettingsOpen(true)} />
+            <TopBar backendOnline={backendOnline} />
             <Routes>
                 <Route path="/" element={
-                    <Landing keysStatus={keysStatus} backendOnline={backendOnline} onOpenSettings={() => setSettingsOpen(true)} />
+                    <Landing backendOnline={backendOnline} />
                 } />
                 <Route path="/project/:id" element={<Editor />} />
                 <Route path="/training" element={<TrainingLab />} />
             </Routes>
-            <SettingsModal
-                open={settingsOpen}
-                onClose={() => setSettingsOpen(false)}
-                onSaved={refreshKeys}
-            />
             <Toaster
                 theme="dark"
                 position="bottom-right"

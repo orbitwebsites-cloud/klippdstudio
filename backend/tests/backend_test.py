@@ -1,4 +1,4 @@
-"""E2E backend tests for AI Video Editor. Tests keys, projects, analyze, render, download."""
+"""E2E backend tests for AI Video Editor. Tests health, projects, analyze, render, download."""
 import os
 import time
 import requests
@@ -29,8 +29,8 @@ def project_id():
     return data["id"]
 
 
-# ---------- Root / Keys ----------
-class TestRootAndKeys:
+# ---------- Root / Health ----------
+class TestRootAndHealth:
     def test_root(self):
         r = requests.get(f"{API}/", timeout=10)
         assert r.status_code == 200
@@ -38,25 +38,12 @@ class TestRootAndKeys:
         assert j["ok"] is True
         assert j["app"] == "Klipped Studio"
 
-    def test_keys_status(self):
-        r = requests.get(f"{API}/keys/status", timeout=10)
+    def test_health(self):
+        r = requests.get(f"{API}/health", timeout=10)
         assert r.status_code == 200
         j = r.json()
-        assert j == {"groq": True, "cerebras": True}
-
-    def test_keys_test(self):
-        r = requests.post(f"{API}/keys/test", timeout=60)
-        assert r.status_code == 200
-        j = r.json()
-        assert j["groq"]["ok"] is True, j["groq"]
-        assert "model" in j["groq"]
-        assert j["cerebras"]["ok"] is True, j["cerebras"]
-        assert "model" in j["cerebras"]
-
-    def test_keys_update_no_downgrade(self):
-        # Post empty dict-ish - should 400
-        r = requests.post(f"{API}/keys", json={}, timeout=10)
-        assert r.status_code == 400
+        assert j["ok"] is True
+        assert all(j["checks"].values())
 
 
 # ---------- Projects CRUD ----------

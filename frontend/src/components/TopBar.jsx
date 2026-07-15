@@ -1,8 +1,7 @@
 import { Link } from "react-router-dom";
-import { Settings, Sparkles, CheckCircle2, XCircle, WifiOff, BrainCircuit } from "lucide-react";
+import { Sparkles, WifiOff, BrainCircuit } from "lucide-react";
 
-export default function TopBar({ keysStatus, backendOnline, onOpenSettings }) {
-    const groqOk = keysStatus.groq;
+export default function TopBar({ backendOnline }) {
     return (
         <header
             className="w-full border-b border-white/10 bg-[#050505] sticky top-0 z-40"
@@ -35,38 +34,8 @@ export default function TopBar({ keysStatus, backendOnline, onOpenSettings }) {
                             <WifiOff className="w-3.5 h-3.5" /> SERVER OFFLINE
                         </div>
                     )}
-                    <div className="hidden md:flex items-center gap-3 text-xs font-mono">
-                        <StatusPill label="GROQ" ok={groqOk} />
-                        <StatusPill label="CEREBRAS" ok={keysStatus.cerebras} />
-                    </div>
-                    <button
-                        onClick={onOpenSettings}
-                        className="btn-ghost !py-2 !px-3"
-                        data-testid="open-settings-btn"
-                    >
-                        <Settings className="w-4 h-4" />
-                        <span className="hidden md:inline">Keys</span>
-                    </button>
                 </div>
             </div>
         </header>
-    );
-}
-
-function StatusPill({ label, ok }) {
-    return (
-        <div
-            className="flex items-center gap-1.5 px-2 py-1 border border-white/10"
-            data-testid={`status-${label.toLowerCase()}`}
-        >
-            {ok ? (
-                <CheckCircle2 className="w-3 h-3 text-[#ccff00]" />
-            ) : (
-                <XCircle className="w-3 h-3 text-white/30" />
-            )}
-            <span className={ok ? "text-white/90" : "text-white/40"}>
-                {label}
-            </span>
-        </div>
     );
 }

@@ -12,7 +12,6 @@ import {
     Film,
     Sparkles,
     Volume2,
-    KeyRound,
     WifiOff,
     RotateCcw,
 } from "lucide-react";
@@ -45,7 +44,7 @@ const STATUS_LABELS = {
     error: "ERROR",
 };
 
-export default function Landing({ keysStatus, backendOnline, onOpenSettings }) {
+export default function Landing({ backendOnline }) {
     const navigate = useNavigate();
     const [projects, setProjects] = useState([]);
     const [uploading, setUploading] = useState(false);
@@ -75,11 +74,6 @@ export default function Landing({ keysStatus, backendOnline, onOpenSettings }) {
         if (!file) return;
         if (backendOnline === false) {
             toast.error("The Klipped Studio server is offline. Try again once it is connected.");
-            return;
-        }
-        if (!keysStatus.groq) {
-            toast.error("Add your Groq API key first (top-right → Keys)");
-            onOpenSettings?.();
             return;
         }
         const validExt = /\.(mp4|mov|mkv|webm|m4v|avi|mpeg|mpg|qt)$/i;
@@ -210,18 +204,6 @@ export default function Landing({ keysStatus, backendOnline, onOpenSettings }) {
                                 <div className="text-white/50 mt-3 text-sm">
                                     or click — MP4, MOV, WEBM. Long-form or short-form. Up to 30min.
                                 </div>
-                                {!keysStatus.groq && (
-                                    <div
-                                        onClick={(e) => {
-                                            e.stopPropagation();
-                                            onOpenSettings?.();
-                                        }}
-                                        className="mt-6 inline-flex items-center gap-2 text-[#ff0050] text-xs font-mono tracking-widest hover:underline cursor-pointer"
-                                        data-testid="need-keys-warning"
-                                    >
-                                        <KeyRound className="w-3 h-3" /> ADD YOUR GROQ KEY FIRST →
-                                    </div>
-                                )}
                             </div>
                         )}
                     </div>

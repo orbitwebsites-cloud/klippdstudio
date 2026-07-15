@@ -1,8 +1,5 @@
 """AI Video Editor Backend
 Endpoints:
-  POST   /api/keys                     Save/update API keys (Fernet-encrypted)
-  GET    /api/keys/status              Which keys are configured
-  POST   /api/keys/test                Test all providers
   POST   /api/projects/upload          Upload a video file
   GET    /api/projects                 List projects
   GET    /api/projects/{id}            Project details
@@ -166,12 +163,6 @@ async def seed_keys_from_env():
 
 
 # ---------- MODELS ----------
-class KeysBody(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    groq: Optional[str] = None
-    cerebras: Optional[str] = None
-
-
 class RenderOptions(BaseModel):
     model_config = ConfigDict(extra="ignore")
     style: Literal["tiktok", "youtube", "luxury"] = "tiktok"
@@ -301,7 +292,7 @@ def _safe_data_file(candidate: str) -> Optional[str]:
         return None
 
 
-# ---------- ROUTES: KEYS ----------
+# ---------- ROUTES ----------
 @api.get("/")
 async def root():
     return {"ok": True, "app": "Klipped Studio", "version": "0.2.0"}
@@ -323,34 +314,6 @@ async def health():
     if not all(checks.values()):
         raise HTTPException(503, detail={"ok": False, "checks": checks})
     return {"ok": True, "checks": checks}
-
-
-@api.get("/keys/status")
-async def keys_status():
-    keys = await get_keys()
-    return {
-        "groq": bool(keys.get("groq")),
-        "cerebras": bool(keys.get("cerebras")),
-    }
-
-
-@api.post("/keys")
-async def set_keys(body: KeysBody):
-    payload = {k: v for k, v in body.model_dump().items() if v}
-    if not payload:
-        raise HTTPException(400, "No keys provided")
-    await save_keys(payload)
-    return {"ok": True, "updated": list(payload.keys())}
-
-
-@api.post("/keys/test")
-async def test_keys():
-    k = await get_keys()
-    g, c = await asyncio.gather(
-        ai.test_groq(k.get("groq", "")),
-        ai.test_cerebras(k.get("cerebras", "")),
-    )
-    return {"groq": g, "cerebras": c}
 
 
 # ---------- TRAINING LAB ----------
@@ -682,7 +645,7 @@ async def _run_analysis(pid: str):
         keys = await get_keys()
         if not keys.get("groq"):
             await update_project(pid, status="error",
-                                 status_message="Groq API key not configured. Add it in Settings.")
+                                 status_message="The AI service is not configured. Please try again later.")
             return
 
         proj = await get_project(pid)

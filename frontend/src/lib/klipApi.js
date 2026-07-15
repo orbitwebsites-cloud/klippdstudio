@@ -197,9 +197,7 @@ export const undoEditChat = (projectId) =>
 export const redoEditChat = (projectId) =>
     api.post(`/projects/${projectId}/edit-chat/redo`).then((r) => r.data);
 
-export const getKeysStatus = () => api.get("/keys/status").then((r) => r.data);
-export const saveKeys = (keys) => api.post("/keys", keys).then((r) => r.data);
-export const testKeys = () => api.post("/keys/test").then((r) => r.data);
+export const getHealth = () => api.get("/health").then((r) => r.data);
 
 export const mediaOriginal = (id) => `${API}/media/original/${id}`;
 export const mediaOutput = (id) => `${API}/media/output/${id}`;
