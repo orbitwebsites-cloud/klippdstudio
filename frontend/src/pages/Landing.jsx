@@ -93,7 +93,9 @@ export default function Landing({ backendOnline }) {
                 toast.warning(`Uploaded, but analysis has not started: ${apiErrorMessage(e, "try again in the project")}`);
             });
             refresh();
-            navigate(`/project/${proj.id}`);
+            try { window.sessionStorage.setItem(`klippd_settings_cue_${proj.id}`, "1"); }
+            catch { /* The editor still works when browser storage is blocked. */ }
+            navigate(`/project/${proj.id}`, { state: { newUpload: true } });
         } catch (e) {
             console.error("upload error", e);
             toast.error(apiErrorMessage(e, "Upload failed"));

@@ -282,6 +282,18 @@ class RenderOptions(BaseModel):
         return self
 
 
+class EditOptions(BaseModel):
+    """Persist the editor controls before a final render is requested."""
+    model_config = ConfigDict(extra="ignore")
+    style: Literal["tiktok", "youtube", "luxury"] = "tiktok"
+    aspect: Literal["16:9", "9:16", "1:1"] = "16:9"
+    remove_fillers: bool = True
+    captions: bool = True
+    sfx: bool = True
+    zoom_ins: bool = True
+    broll: bool = True
+
+
 class AnalyzeBody(BaseModel):
     model_config = ConfigDict(extra="ignore")
     requested_profile: Optional[Literal["general", "gaming", "minecraft_narrative", "talking_head"]] = None
@@ -939,6 +951,14 @@ async def upload_finalize(upload_id: str):
 @api.get("/projects/{pid}")
 async def project_detail(pid: str):
     return await get_project(pid)
+
+
+@api.put("/projects/{pid}/edit-options")
+async def save_edit_options(pid: str, options: EditOptions):
+    await get_project(pid)
+    saved = options.model_dump()
+    await update_project(pid, edit_options=saved)
+    return {"ok": True, "edit_options": saved}
 
 
 @api.delete("/projects/{pid}")

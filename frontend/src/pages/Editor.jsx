@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, useLocation } from "react-router-dom";
 import { toast } from "sonner";
 import {
     ArrowLeft,
@@ -19,6 +19,7 @@ import {
     Smartphone,
     Square,
     AlertTriangle,
+    ArrowDown,
 } from "lucide-react";
 import LibraryPanel from "@/components/LibraryPanel";
 import CreatorProfilesPanel from "@/components/CreatorProfilesPanel";
@@ -36,6 +37,7 @@ import {
     mediaClip,
     downloadUrl,
     apiErrorMessage,
+    saveEditOptions,
 } from "@/lib/klipApi";
 
 const STATUS_LABELS = {
@@ -58,6 +60,7 @@ const IN_PROGRESS = new Set([
 export default function Editor() {
     const { id } = useParams();
     const navigate = useNavigate();
+    const location = useLocation();
     const [project, setProject] = useState(null);
     const [style, setStyle] = useState("tiktok");
     const [aspect, setAspect] = useState("16:9");
@@ -78,9 +81,12 @@ export default function Editor() {
     const [currentTime, setCurrentTime] = useState(0);
     const [libraryPick, setLibraryPick] = useState(null);
     const [creatorProfileId, setCreatorProfileId] = useState(null);
+    const [draftLoadedFor, setDraftLoadedFor] = useState(null);
+    const [showSettingsCue, setShowSettingsCue] = useState(false);
     const videoRef = useRef();
     const transcriptRef = useRef();
     const brollFileInputRef = useRef();
+    const settingsRef = useRef();
     const trainingProfileId = useMemo(() => {
         try { return window.localStorage.getItem("klipped_active_training_profile") || null; }
         catch { return null; }
@@ -109,6 +115,12 @@ export default function Editor() {
                 toast.error(e?.response?.data?.detail || "Analysis failed to start"));
         }
     }, [project, id, refresh, trainingProfileId]);
+
+    useEffect(() => {
+        if (!location.state?.newUpload) return;
+        try { window.sessionStorage.setItem(`klippd_settings_cue_${id}`, "1"); }
+        catch { /* The cue is non-essential. */ }
+    }, [id, location.state]);
 
     const words = useMemo(() => project?.transcript?.words || [], [project?.transcript?.words]);
     const analysis = project?.analysis || {};
@@ -154,6 +166,40 @@ export default function Editor() {
         }
         if (project.creator_profile_id) setCreatorProfileId(project.creator_profile_id);
     }, [project?.chat_render_options, project?.creator_profile_id]);
+
+    useEffect(() => {
+        if (!project || draftLoadedFor === project.id) return;
+        const saved = project.edit_options || {};
+        if (saved.style) setStyle(saved.style);
+        if (saved.aspect) setAspect(saved.aspect);
+        setRenderOpts((current) => ({
+            ...current,
+            ...Object.fromEntries(
+                ["remove_fillers", "captions", "sfx", "zoom_ins", "broll"]
+                    .filter((key) => typeof saved[key] === "boolean")
+                    .map((key) => [key, saved[key]])
+            ),
+        }));
+        setDraftLoadedFor(project.id);
+    }, [project, draftLoadedFor]);
+
+    useEffect(() => {
+        if (!project || !["ready", "done"].includes(project.status)) return;
+        try {
+            if (window.sessionStorage.getItem(`klippd_settings_cue_${id}`) === "1") {
+                setShowSettingsCue(true);
+            }
+        } catch { /* The cue is non-essential. */ }
+    }, [id, project?.status]);
+
+    useEffect(() => {
+        if (!project || draftLoadedFor !== project.id) return undefined;
+        const timer = window.setTimeout(() => {
+            saveEditOptions(id, { style, aspect, ...renderOpts })
+                .catch(() => toast.error("Could not save edit settings. Try again before rendering."));
+        }, 500);
+        return () => window.clearTimeout(timer);
+    }, [id, project?.id, draftLoadedFor, style, aspect, renderOpts]);
 
     const effectiveFillers = useMemo(() => {
         const s = new Set(autoFillers);
@@ -326,6 +372,15 @@ export default function Editor() {
     // main player to the final endpoint when a main output actually exists.
     const hasMainOutput = Boolean(project.output_path);
 
+    const jumpToSettings = () => {
+        settingsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+        setShowSettingsCue(false);
+        try { window.sessionStorage.removeItem(`klippd_settings_cue_${id}`); }
+        catch { /* The cue is non-essential. */ }
+    };
+
+    const shouldShowSettingsCue = isReady && showSettingsCue;
+
     return (
         <div className="min-h-[calc(100vh-72px)] px-4 md:px-8 py-8" data-testid="editor-page">
             <div className="flex items-start justify-between mb-6 gap-4">
@@ -376,6 +431,21 @@ export default function Editor() {
                         <RefreshCw className="w-4 h-4" /> {project.transcript ? "Retry Final Render" : "Retry Analysis"}
                     </button>
                 </div>
+            )}
+
+            {shouldShowSettingsCue && (
+                <button
+                    type="button"
+                    onClick={jumpToSettings}
+                    className="lg:hidden w-full mb-6 border border-[#ccff00] bg-[#ccff00]/10 px-5 py-4 text-left flex items-center justify-between gap-4"
+                    data-testid="settings-cue"
+                >
+                    <span>
+                        <span className="block font-heading text-2xl tracking-wider text-[#ccff00]">YOUR EDIT IS READY</span>
+                        <span className="block mt-1 text-sm text-white/70">Choose your format, style, and edit options below.</span>
+                    </span>
+                    <ArrowDown className="w-7 h-7 shrink-0 text-[#ccff00] animate-bounce" aria-hidden="true" />
+                </button>
             )}
 
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -459,7 +529,7 @@ export default function Editor() {
                 </div>
 
                 {isReady && (
-                <aside className="space-y-6" data-testid="editor-sidebar">
+                <aside ref={settingsRef} className="space-y-6 scroll-mt-24" data-testid="editor-sidebar">
                     <CreatorProfilesPanel
                         selectedProfileId={creatorProfileId}
                         onSelectProfile={setCreatorProfileId}

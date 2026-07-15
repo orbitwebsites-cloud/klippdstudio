@@ -14,6 +14,8 @@ export const listProjects = () => api.get("/projects").then((r) => {
     return r.data;
 });
 export const getProject = (id) => api.get(`/projects/${id}`).then((r) => r.data);
+export const saveEditOptions = (id, options) =>
+    api.put(`/projects/${id}/edit-options`, options).then((r) => r.data);
 export const deleteProject = (id) => api.delete(`/projects/${id}`).then((r) => r.data);
 
 // Chunked upload with per-chunk retries + resume support.
