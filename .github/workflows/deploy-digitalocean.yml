@@ -130,17 +130,33 @@ jobs:
           tar -xzf /root/klippdstudio.tar.gz -C "$APP_DIR"
           mkdir -p /opt/klippd/data
           install -m 600 /root/klippd.env /opt/klippd/klippd.env
+          cat > /opt/klippd/Caddyfile <<'EOF'
+          api.klippdstudio.com {
+            reverse_proxy klippd-backend:8000
+          }
+          EOF
+          docker network create klippd-net 2>/dev/null || true
           docker rm -f klippd-backend 2>/dev/null || true
           docker build -f /opt/klippdstudio/backend/Dockerfile -t klippd-backend /opt/klippdstudio
-          docker run -d --name klippd-backend --restart unless-stopped --env-file /opt/klippd/klippd.env -v /opt/klippd/data:/app/data -p 8000:8000 klippd-backend
+          docker run -d --name klippd-backend --network klippd-net --restart unless-stopped --env-file /opt/klippd/klippd.env -v /opt/klippd/data:/app/data -p 8000:8000 klippd-backend
           for attempt in {1..24}; do
             if curl --fail --silent --show-error http://127.0.0.1:8000/api/health; then
+              break
+            fi
+            sleep 5
+          done
+          curl --fail --silent --show-error http://127.0.0.1:8000/api/health
+          docker rm -f klippd-caddy 2>/dev/null || true
+          docker run -d --name klippd-caddy --network klippd-net --restart unless-stopped -p 80:80 -p 443:443 -v /opt/klippd/Caddyfile:/etc/caddy/Caddyfile:ro -v /opt/klippd/caddy-data:/data -v /opt/klippd/caddy-config:/config caddy:2-alpine
+          for attempt in {1..24}; do
+            if curl --fail --silent --show-error --resolve api.klippdstudio.com:443:127.0.0.1 https://api.klippdstudio.com/api/health; then
               exit 0
             fi
             sleep 5
           done
           docker ps -a
           docker logs --tail 200 klippd-backend || true
+          docker logs --tail 200 klippd-caddy || true
           exit 1
           REMOTE
           rm -f /tmp/klippd.env /tmp/klippdstudio.tar.gz
