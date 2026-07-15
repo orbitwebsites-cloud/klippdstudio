@@ -141,16 +141,22 @@ def _operation_summary(operation: dict[str, Any]) -> str:
     return labels.get(operation.get("type"), "Edit timeline")
 
 
-def register_premium_routes(api, db, user_id: str, get_project, update_project) -> None:
+def register_premium_routes(api, db, user_id: str, get_project, update_project, require_plan=None) -> None:
     repository = CreatorDNARepository(db)
+
+    def require_pro() -> None:
+        if require_plan:
+            require_plan("pro")
 
     @api.get("/creator-profiles")
     async def list_creator_profiles():
+        require_pro()
         return {"profiles": [_profile_json(item) for item in await repository.list(user_id)]}
 
     @api.post("/creator-profiles/analyze")
     @api.post("/creator-profiles")
     async def analyze_creator_profile(body: CreatorProfileBody):
+        require_pro()
         if not body.rights_attested or body.consent_scope != "editing_style_analysis":
             raise HTTPException(422, "Creator DNA requires rights, consent, and the editing-style analysis scope")
         sources = [_source_payload(item, index) for index, item in enumerate(body.references)]
@@ -180,6 +186,7 @@ def register_premium_routes(api, db, user_id: str, get_project, update_project) 
         return {"profile": _profile_json(profile)}
 
     async def context(pid: str):
+        require_pro()
         project = await get_project(pid)
         profiles = [_profile_json(item) for item in await repository.list(user_id)]
         chat = copy.deepcopy(project.get("edit_chat") or {})

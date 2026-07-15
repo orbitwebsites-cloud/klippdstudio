@@ -30,7 +30,7 @@ import uuid
 import shutil
 import asyncio
 import aiofiles
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import ai_services as ai
@@ -86,9 +86,42 @@ COMPRESS_UPLOADS = os.environ.get("COMPRESS_UPLOADS", "true").lower() in {"1", "
 UPLOAD_COMPRESSION_MIN_BYTES = int(os.environ.get("UPLOAD_COMPRESSION_MIN_BYTES", str(25 * 1024 * 1024)))
 UPLOAD_COMPRESSION_MAX_WIDTH = int(os.environ.get("UPLOAD_COMPRESSION_MAX_WIDTH", "1920"))
 UPLOAD_COMPRESSION_CRF = int(os.environ.get("UPLOAD_COMPRESSION_CRF", "26"))
+RETENTION_SWEEP_HOURS = max(1, int(os.environ.get("RETENTION_SWEEP_HOURS", "6")))
 CHUNK_BYTES = 4 * 1024 * 1024
 
 USER_ID = "default_user"  # single-user MVP
+
+PLAN_POLICIES = {
+    "basic": {"price_usd_monthly": 19, "retention_days": 7},
+    "pro": {"price_usd_monthly": 49, "retention_days": 30},
+    "elite": {"price_usd_monthly": 149, "retention_days": None},
+    "enterprise": {"price_usd_per_seat_monthly": 120, "retention_days": None},
+}
+PLAN_RANK = {"basic": 0, "pro": 1, "elite": 2, "enterprise": 3}
+
+
+def subscription_plan() -> str:
+    """Read the plan only from trusted server configuration, never a client request."""
+    plan = os.environ.get("SUBSCRIPTION_PLAN", "basic").strip().lower()
+    if plan not in PLAN_POLICIES:
+        logger.warning("Unknown SUBSCRIPTION_PLAN %r; using basic", plan)
+        return "basic"
+    if plan == "enterprise" and os.environ.get("ENTERPRISE_APPROVED", "").lower() not in {"1", "true", "yes"}:
+        logger.warning("Enterprise plan requires ENTERPRISE_APPROVED=true; using basic")
+        return "basic"
+    return plan
+
+
+def project_retention(plan: Optional[str] = None) -> tuple[str, Optional[datetime]]:
+    plan = plan if plan in PLAN_POLICIES else subscription_plan()
+    days = PLAN_POLICIES[plan]["retention_days"]
+    return plan, datetime.now(timezone.utc) + timedelta(days=days) if days is not None else None
+
+
+def require_plan(required_plan: str) -> None:
+    current_plan = subscription_plan()
+    if PLAN_RANK[current_plan] < PLAN_RANK[required_plan]:
+        raise HTTPException(403, f"This feature requires the {required_plan.title()} plan or higher")
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s | %(message)s")
@@ -253,6 +286,57 @@ def _remove_project_files(doc: Dict[str, Any]) -> None:
                 logger.warning("Could not remove project file %s", safe_path)
 
 
+def _parse_project_expiry(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+async def purge_expired_projects() -> int:
+    """Delete expired projects and migrate older records to the current plan policy."""
+    now = datetime.now(timezone.utc)
+    removed = 0
+    projects = await db.projects.find({"user_id": USER_ID}, {"_id": 0}).to_list(10000)
+    for project in projects:
+        plan = project.get("subscription_plan") or subscription_plan()
+        if plan not in PLAN_POLICIES:
+            plan = "basic"
+        expires_at = _parse_project_expiry(project.get("expires_at"))
+        if expires_at is None and PLAN_POLICIES[plan]["retention_days"] is not None:
+            created_at = _parse_project_expiry(project.get("created_at")) or now
+            expires_at = created_at + timedelta(days=PLAN_POLICIES[plan]["retention_days"])
+            await db.projects.update_one(
+                {"id": project["id"]},
+                {"$set": {"subscription_plan": plan, "expires_at": expires_at.isoformat()}},
+            )
+        if expires_at and expires_at <= now:
+            _remove_project_files(project)
+            await db.projects.delete_one({"id": project["id"]})
+            removed += 1
+    if removed:
+        logger.info("Removed %s expired project(s)", removed)
+    return removed
+
+
+async def _retention_sweeper() -> None:
+    while True:
+        await asyncio.sleep(RETENTION_SWEEP_HOURS * 60 * 60)
+        try:
+            await purge_expired_projects()
+        except Exception:
+            logger.exception("Retention sweep failed")
+
+
+@app.on_event("startup")
+async def start_retention_sweeper():
+    await purge_expired_projects()
+    app.state.retention_task = asyncio.create_task(_retention_sweeper())
+
+
 async def _compress_project_source(pid: str, proj: Dict[str, Any]) -> Dict[str, Any]:
     """Replace a large upload with a smaller working source when it saves space."""
     if not COMPRESS_UPLOADS or proj.get("source_optimized"):
@@ -384,6 +468,20 @@ async def health():
     return {"ok": True, "checks": checks}
 
 
+@api.get("/subscription")
+async def subscription_status():
+    """Return the plan applied by the trusted billing/admin system."""
+    plan = subscription_plan()
+    policy = PLAN_POLICIES[plan]
+    return {
+        "plan": plan,
+        "retention_days": policy["retention_days"],
+        "price_usd_monthly": policy.get("price_usd_monthly"),
+        "price_usd_per_seat_monthly": policy.get("price_usd_per_seat_monthly"),
+        "enterprise_qualified": plan == "enterprise",
+    }
+
+
 # ---------- TRAINING LAB ----------
 @api.get("/training/dashboard")
 async def training_dashboard():
@@ -481,6 +579,7 @@ async def upload_project(file: UploadFile = File(...)):
         dst.unlink(missing_ok=True)
         raise HTTPException(400, f"Could not read video file ({ext}): {str(e)[:200]}")
 
+    plan, expires_at = project_retention()
     project = {
         "id": pid,
         "user_id": USER_ID,
@@ -496,6 +595,9 @@ async def upload_project(file: UploadFile = File(...)):
         "fps": meta.get("fps", 30),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
+        "subscription_plan": plan,
+        "retention_days": PLAN_POLICIES[plan]["retention_days"],
+        "expires_at": expires_at.isoformat() if expires_at else None,
         "transcript": None,
         "analysis": None,
         "output_path": None,
@@ -660,6 +762,7 @@ async def upload_finalize(upload_id: str):
     shutil.rmtree(session_dir, ignore_errors=True)
     upload_locks.pop(upload_id, None)
 
+    plan, expires_at = project_retention()
     project = {
         "id": pid,
         "user_id": USER_ID,
@@ -675,6 +778,9 @@ async def upload_finalize(upload_id: str):
         "fps": meta.get("fps", 30),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
+        "subscription_plan": plan,
+        "retention_days": PLAN_POLICIES[plan]["retention_days"],
+        "expires_at": expires_at.isoformat() if expires_at else None,
         "transcript": None,
         "analysis": None,
         "output_path": None,
@@ -1104,6 +1210,7 @@ async def broll_upload(
 @api.post("/projects/{pid}/viral_clips")
 async def viral_clips(pid: str):
     """Ask LLM to find the 3-5 best viral-worthy short clip moments in this project."""
+    require_plan("pro")
     proj = await get_project(pid)
     transcript = proj.get("transcript") or {}
     words = transcript.get("words", [])
@@ -1345,7 +1452,7 @@ async def media_output(pid: str):
 
 
 # ---------- APP WIRING ----------
-register_premium_routes(api, db, USER_ID, get_project, update_project)
+register_premium_routes(api, db, USER_ID, get_project, update_project, require_plan)
 app.include_router(api)
 cors_origins = [origin.strip() for origin in os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",") if origin.strip()]
 app.add_middleware(
@@ -1359,5 +1466,8 @@ app.add_middleware(
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
+    task = getattr(app.state, "retention_task", None)
+    if task:
+        task.cancel()
     if client is not None:
         client.close()
