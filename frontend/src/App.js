@@ -1,12 +1,17 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { Toaster } from "sonner";
 import TopBar from "@/components/TopBar";
 import Landing from "@/pages/Landing";
-import Editor from "@/pages/Editor";
-import TrainingLab from "@/pages/TrainingLab";
 import { getHealth } from "@/lib/klipApi";
 import "@/App.css";
+
+const Editor = lazy(() => import("@/pages/Editor"));
+const TrainingLab = lazy(() => import("@/pages/TrainingLab"));
+
+function RouteLoading() {
+    return <div className="min-h-[calc(100vh-72px)]" aria-busy="true" />;
+}
 
 function App() {
     const [backendOnline, setBackendOnline] = useState(null);
@@ -26,8 +31,12 @@ function App() {
                 <Route path="/" element={
                     <Landing backendOnline={backendOnline} />
                 } />
-                <Route path="/project/:id" element={<Editor />} />
-                <Route path="/training" element={<TrainingLab />} />
+                <Route path="/project/:id" element={
+                    <Suspense fallback={<RouteLoading />}><Editor /></Suspense>
+                } />
+                <Route path="/training" element={
+                    <Suspense fallback={<RouteLoading />}><TrainingLab /></Suspense>
+                } />
             </Routes>
             <Toaster
                 theme="dark"

@@ -82,6 +82,10 @@ cipher = Fernet(_master_key())
 
 MAX_VIDEO_BYTES = int(os.environ.get("MAX_VIDEO_BYTES", str(2 * 1024 * 1024 * 1024)))
 MAX_ASSET_BYTES = int(os.environ.get("MAX_ASSET_BYTES", str(500 * 1024 * 1024)))
+COMPRESS_UPLOADS = os.environ.get("COMPRESS_UPLOADS", "true").lower() in {"1", "true", "yes"}
+UPLOAD_COMPRESSION_MIN_BYTES = int(os.environ.get("UPLOAD_COMPRESSION_MIN_BYTES", str(25 * 1024 * 1024)))
+UPLOAD_COMPRESSION_MAX_WIDTH = int(os.environ.get("UPLOAD_COMPRESSION_MAX_WIDTH", "1920"))
+UPLOAD_COMPRESSION_CRF = int(os.environ.get("UPLOAD_COMPRESSION_CRF", "26"))
 CHUNK_BYTES = 4 * 1024 * 1024
 
 USER_ID = "default_user"  # single-user MVP
@@ -228,6 +232,70 @@ async def get_project(pid: str) -> Dict:
     if not doc:
         raise HTTPException(404, "Project not found")
     return doc
+
+
+def _remove_project_files(doc: Dict[str, Any]) -> None:
+    """Remove only this project's files, including auxiliary clip renders."""
+    paths = [doc.get(key) for key in ("original_path", "audio_path", "output_path")]
+    paths.extend((doc.get("viral_renders") or {}).values())
+    pid = str(doc.get("id") or "")
+    if pid:
+        paths.extend([
+            DATA_DIR / "output" / f"{pid}_cut.mp4",
+            DATA_DIR / "subtitles" / f"{pid}.ass",
+        ])
+    for candidate in paths:
+        safe_path = _safe_data_file(str(candidate)) if candidate else None
+        if safe_path:
+            try:
+                Path(safe_path).unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Could not remove project file %s", safe_path)
+
+
+async def _compress_project_source(pid: str, proj: Dict[str, Any]) -> Dict[str, Any]:
+    """Replace a large upload with a smaller working source when it saves space."""
+    if not COMPRESS_UPLOADS or proj.get("source_optimized"):
+        return proj
+    source = Path(proj.get("original_path") or "")
+    if not source.is_file() or source.stat().st_size < UPLOAD_COMPRESSION_MIN_BYTES:
+        await update_project(pid, source_optimized=True)
+        return proj
+
+    original_size = source.stat().st_size
+    candidate = DATA_DIR / "videos" / f"{pid}.optimized.mp4"
+    final_path = DATA_DIR / "videos" / f"{pid}.mp4"
+    try:
+        await asyncio.to_thread(
+            vp.compress_upload, str(source), str(candidate),
+            UPLOAD_COMPRESSION_MAX_WIDTH, UPLOAD_COMPRESSION_CRF,
+        )
+        compressed_size = candidate.stat().st_size
+        if compressed_size >= original_size * 0.95:
+            candidate.unlink(missing_ok=True)
+            await update_project(pid, source_optimized=True)
+            return proj
+        os.replace(candidate, final_path)
+        if source != final_path:
+            source.unlink(missing_ok=True)
+        meta = await asyncio.to_thread(vp.probe_video, str(final_path))
+        fields = {
+            "original_path": str(final_path),
+            "size_bytes": compressed_size,
+            "width": meta.get("width", proj.get("width", 0)),
+            "height": meta.get("height", proj.get("height", 0)),
+            "fps": meta.get("fps", proj.get("fps", 30)),
+            "source_optimized": True,
+            "source_size_bytes": original_size,
+            "storage_saved_bytes": original_size - compressed_size,
+        }
+        await update_project(pid, **fields)
+        return {**proj, **fields}
+    except Exception:
+        candidate.unlink(missing_ok=True)
+        logger.exception("Upload compression failed for project %s; keeping original", pid)
+        await update_project(pid, source_optimized=True)
+        return proj
 
 
 def _clean_training_principles(values: List[str]) -> List[str]:
@@ -627,14 +695,7 @@ async def delete_project(pid: str):
     doc = await db.projects.find_one({"id": pid})
     if not doc:
         raise HTTPException(404)
-    # Clean files
-    for k in ("original_path", "audio_path", "output_path"):
-        p = doc.get(k)
-        if p and os.path.exists(p):
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+    _remove_project_files(doc)
     await db.projects.delete_one({"id": pid})
     return {"ok": True}
 
@@ -649,6 +710,10 @@ async def _run_analysis(pid: str):
             return
 
         proj = await get_project(pid)
+        if COMPRESS_UPLOADS and not proj.get("source_optimized"):
+            await update_project(pid, status="extracting_audio", progress=2,
+                                 status_message="Optimizing upload storage...")
+            proj = await _compress_project_source(pid, proj)
         await update_project(pid, status="extracting_audio", progress=5,
                              status_message="Extracting audio...")
 
@@ -658,7 +723,11 @@ async def _run_analysis(pid: str):
                              status="transcribing",
                              status_message="Transcribing with Whisper (Groq)...")
 
-        transcript = await ai.transcribe_audio(audio_path, keys["groq"])
+        try:
+            transcript = await ai.transcribe_audio(audio_path, keys["groq"])
+        finally:
+            Path(audio_path).unlink(missing_ok=True)
+            await update_project(pid, audio_path=None)
         await update_project(pid, transcript=transcript, progress=55,
                              status="analyzing",
                              status_message="AI analyzing for fillers, emphasis, B-roll...")

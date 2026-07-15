@@ -60,6 +60,23 @@ def extract_audio(input_path: str, output_path: str) -> None:
     run_ff(cmd)
 
 
+def compress_upload(input_path: str, output_path: str, max_width: int = 1920,
+                    crf: int = 26) -> None:
+    """Create a compact H.264 working source without upscaling smaller uploads."""
+    scale = f"scale=w='min({max_width},iw)':h=-2"
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-map", "0:v:0", "-map", "0:a?",
+        "-vf", scale,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "96k", "-ar", "44100",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    run_ff(cmd)
+
+
 # ---------- FILLER SEGMENT MERGING ----------
 def build_keep_segments(words: List[Dict], filler_indices: List[int],
                         duration: float, pad: float = 0.03) -> List[Dict]:
@@ -386,10 +403,10 @@ def render_final(cut_video: str, ass_file: Optional[str], sfx_events: List[float
     else:
         cmd += ["-map", "0:v", "-map", "0:a"]
     cmd += [
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
         "-pix_fmt", "yuv420p",
         "-profile:v", "main", "-level", "4.0",
-        "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
+        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
         "-movflags", "+faststart",
         "-shortest",
         output_path,
