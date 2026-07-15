@@ -29,6 +29,9 @@ export default function TopBar({ backendOnline }) {
                     <Link to="/training" className="hidden sm:flex items-center gap-2 text-xs font-mono tracking-wider text-white/60 hover:text-[#ccff00]">
                         <BrainCircuit className="w-4 h-4" /> TRAINING LAB
                     </Link>
+                    <Link to="/pricing" className="hidden sm:flex text-xs font-mono tracking-wider text-white/60 hover:text-[#ccff00]">
+                        PRICING
+                    </Link>
                     {backendOnline === false && (
                         <div className="hidden sm:flex items-center gap-1.5 text-[#ff5a5a] text-[10px] font-mono tracking-wider">
                             <WifiOff className="w-3.5 h-3.5" /> SERVER OFFLINE

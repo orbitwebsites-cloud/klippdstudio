@@ -26,6 +26,11 @@ jobs:
       SEED_CEREBRAS_KEY: ${{ secrets.SEED_CEREBRAS_KEY }}
       SUBSCRIPTION_PLAN: ${{ secrets.SUBSCRIPTION_PLAN }}
       ENTERPRISE_APPROVED: ${{ secrets.ENTERPRISE_APPROVED }}
+      STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+      STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
+      STRIPE_PRICE_BASIC: ${{ secrets.STRIPE_PRICE_BASIC }}
+      STRIPE_PRICE_PRO: ${{ secrets.STRIPE_PRICE_PRO }}
+      STRIPE_PRICE_ELITE: ${{ secrets.STRIPE_PRICE_ELITE }}
       CORS_ORIGINS: https://klippdstudio.com,https://www.klippdstudio.com
     steps:
       - uses: actions/checkout@v4
@@ -86,6 +91,12 @@ jobs:
           SEED_CEREBRAS_KEY=$SEED_CEREBRAS_KEY
           SUBSCRIPTION_PLAN=${SUBSCRIPTION_PLAN:-basic}
           ENTERPRISE_APPROVED=$ENTERPRISE_APPROVED
+          STRIPE_SECRET_KEY=$STRIPE_SECRET_KEY
+          STRIPE_WEBHOOK_SECRET=$STRIPE_WEBHOOK_SECRET
+          STRIPE_PRICE_BASIC=$STRIPE_PRICE_BASIC
+          STRIPE_PRICE_PRO=$STRIPE_PRICE_PRO
+          STRIPE_PRICE_ELITE=$STRIPE_PRICE_ELITE
+          FRONTEND_URL=https://klippdstudio.com
           RETENTION_SWEEP_HOURS=6
           DATA_DIR=/app/data
           EOF

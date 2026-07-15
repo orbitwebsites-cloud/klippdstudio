@@ -8,6 +8,7 @@ import "@/App.css";
 
 const Editor = lazy(() => import("@/pages/Editor"));
 const TrainingLab = lazy(() => import("@/pages/TrainingLab"));
+const Pricing = lazy(() => import("@/pages/Pricing"));
 
 function RouteLoading() {
     return <div className="min-h-[calc(100vh-72px)]" aria-busy="true" />;
@@ -36,6 +37,9 @@ function App() {
                 } />
                 <Route path="/training" element={
                     <Suspense fallback={<RouteLoading />}><TrainingLab /></Suspense>
+                } />
+                <Route path="/pricing" element={
+                    <Suspense fallback={<RouteLoading />}><Pricing /></Suspense>
                 } />
             </Routes>
             <Toaster

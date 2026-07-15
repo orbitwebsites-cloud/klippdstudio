@@ -11,4 +11,6 @@ Required repository secrets:
 
 Optional secrets: `SEED_GROQ_KEY`, `SEED_CEREBRAS_KEY`, and `SUBSCRIPTION_PLAN` (`basic`, `pro`, `elite`, or `enterprise`). `basic` is the default. Enterprise additionally requires `ENTERPRISE_APPROVED=true`; do not set that secret until the organization has been qualified.
 
+To enable Stripe subscriptions, add `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_BASIC`, `STRIPE_PRICE_PRO`, and `STRIPE_PRICE_ELITE`. Configure the Stripe webhook endpoint as `https://api.klippdstudio.com/api/billing/webhook` for `checkout.session.completed`, `customer.subscription.updated`, and `customer.subscription.deleted`. The workflow supplies these values only to the backend container.
+
 The workflow deliberately has no `push` trigger. It creates a paid Droplet, even when DigitalOcean credits cover the invoice. After the first run, set a DNS A record for `api.klippdstudio.com` to the workflow output IP, put HTTPS in front of it, and set the frontend `REACT_APP_BACKEND_URL` to that URL.

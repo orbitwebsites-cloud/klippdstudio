@@ -198,6 +198,9 @@ export const redoEditChat = (projectId) =>
     api.post(`/projects/${projectId}/edit-chat/redo`).then((r) => r.data);
 
 export const getHealth = () => api.get("/health").then((r) => r.data);
+export const getSubscription = () => api.get("/subscription").then((r) => r.data);
+export const createCheckout = (plan) => api.post("/billing/checkout", { plan }).then((r) => r.data);
+export const createBillingPortal = () => api.post("/billing/portal").then((r) => r.data);
 
 export const mediaOriginal = (id) => `${API}/media/original/${id}`;
 export const mediaOutput = (id) => `${API}/media/output/${id}`;

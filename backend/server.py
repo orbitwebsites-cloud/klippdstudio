@@ -30,6 +30,7 @@ import uuid
 import shutil
 import asyncio
 import aiofiles
+import stripe
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
@@ -130,12 +131,17 @@ logger = logging.getLogger("backend")
 app = FastAPI(title="AI Video Editor")
 api = APIRouter(prefix="/api")
 APP_ACCESS_TOKEN = os.environ.get("APP_ACCESS_TOKEN", "").strip()
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "").strip()
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000").rstrip("/")
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
 
 
 @app.middleware("http")
 async def optional_access_token(request: Request, call_next):
     """Optional MVP gate; leave unset locally and protect public deployments."""
-    if APP_ACCESS_TOKEN and request.method != "OPTIONS" and request.url.path != "/api/health":
+    if APP_ACCESS_TOKEN and request.method != "OPTIONS" and request.url.path not in {"/api/health", "/api/billing/webhook"}:
         bearer = request.headers.get("authorization", "")
         supplied = request.headers.get("x-app-token", "")
         if bearer.lower().startswith("bearer "):
@@ -182,6 +188,49 @@ async def save_keys(new_keys: Dict[str, str]) -> None:
     )
 
 
+def _stripe_price_id(plan: str) -> str:
+    return os.environ.get(f"STRIPE_PRICE_{plan.upper()}", "").strip()
+
+
+def _plan_from_subscription(subscription: Any) -> str:
+    metadata = subscription.get("metadata") or {}
+    candidate = str(metadata.get("plan") or "").lower()
+    if candidate in {"basic", "pro", "elite"}:
+        return candidate
+    for item in (subscription.get("items") or {}).get("data", []):
+        price_id = str((item.get("price") or {}).get("id") or "")
+        for plan in ("basic", "pro", "elite"):
+            if price_id and price_id == _stripe_price_id(plan):
+                return plan
+    return "basic"
+
+
+async def _apply_stripe_subscription(subscription: Any, customer_id: Optional[str] = None) -> str:
+    status = str(subscription.get("status") or "")
+    plan = _plan_from_subscription(subscription)
+    active = status in {"active", "trialing"}
+    effective_plan = plan if active else "basic"
+    record = {
+        "provider": "stripe",
+        "subscription_id": str(subscription.get("id") or ""),
+        "customer_id": str(customer_id or subscription.get("customer") or ""),
+        "status": status,
+        "plan": plan,
+        "effective_plan": effective_plan,
+        "cancel_at_period_end": bool(subscription.get("cancel_at_period_end")),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.settings.update_one(
+        {"user_id": USER_ID},
+        {"$set": {"billing_subscription": record}},
+        upsert=True,
+    )
+    os.environ["SUBSCRIPTION_PLAN"] = effective_plan
+    await reconcile_project_retention(effective_plan)
+    await purge_expired_projects()
+    return effective_plan
+
+
 @app.on_event("startup")
 async def seed_keys_from_env():
     """If DB has no keys yet, seed from env vars (SEED_*_KEY)."""
@@ -197,6 +246,15 @@ async def seed_keys_from_env():
     if seed:
         await save_keys(seed)
         logger.info(f"Seeded keys from env: {list(seed.keys())}")
+
+
+@app.on_event("startup")
+async def restore_stripe_subscription():
+    """Restore a paid workspace plan after a container restart."""
+    settings = await db.settings.find_one({"user_id": USER_ID}) or {}
+    subscription = settings.get("billing_subscription") or {}
+    if subscription.get("status") in {"active", "trialing"} and subscription.get("plan") in {"basic", "pro", "elite"}:
+        os.environ["SUBSCRIPTION_PLAN"] = subscription["plan"]
 
 
 # ---------- MODELS ----------
@@ -231,6 +289,10 @@ class AnalyzeBody(BaseModel):
     model_config = ConfigDict(extra="ignore")
     requested_profile: Optional[Literal["general", "gaming", "minecraft_narrative", "talking_head"]] = None
     training_profile_id: Optional[str] = Field(default=None, max_length=64)
+
+
+class CheckoutBody(BaseModel):
+    plan: Literal["basic", "pro", "elite"]
 
 
 class TrainingReferenceBody(BaseModel):
@@ -322,6 +384,26 @@ async def purge_expired_projects() -> int:
     return removed
 
 
+async def reconcile_project_retention(plan: str) -> None:
+    """Apply the active workspace policy to existing projects after plan changes."""
+    if plan not in PLAN_POLICIES:
+        plan = "basic"
+    days = PLAN_POLICIES[plan]["retention_days"]
+    now = datetime.now(timezone.utc)
+    projects = await db.projects.find({"user_id": USER_ID}, {"_id": 0}).to_list(10000)
+    for project in projects:
+        created_at = _parse_project_expiry(project.get("created_at")) or now
+        expires_at = created_at + timedelta(days=days) if days is not None else None
+        await db.projects.update_one(
+            {"id": project["id"]},
+            {"$set": {
+                "subscription_plan": plan,
+                "retention_days": days,
+                "expires_at": expires_at.isoformat() if expires_at else None,
+            }},
+        )
+
+
 async def _retention_sweeper() -> None:
     while True:
         await asyncio.sleep(RETENTION_SWEEP_HOURS * 60 * 60)
@@ -333,6 +415,7 @@ async def _retention_sweeper() -> None:
 
 @app.on_event("startup")
 async def start_retention_sweeper():
+    await reconcile_project_retention(subscription_plan())
     await purge_expired_projects()
     app.state.retention_task = asyncio.create_task(_retention_sweeper())
 
@@ -473,13 +556,78 @@ async def subscription_status():
     """Return the plan applied by the trusted billing/admin system."""
     plan = subscription_plan()
     policy = PLAN_POLICIES[plan]
+    settings = await db.settings.find_one({"user_id": USER_ID}) or {}
+    billing_subscription = settings.get("billing_subscription") or {}
     return {
         "plan": plan,
         "retention_days": policy["retention_days"],
         "price_usd_monthly": policy.get("price_usd_monthly"),
         "price_usd_per_seat_monthly": policy.get("price_usd_per_seat_monthly"),
         "enterprise_qualified": plan == "enterprise",
+        "billing_enabled": bool(STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET),
+        "has_billing_subscription": bool(billing_subscription.get("customer_id")),
     }
+
+
+@api.post("/billing/checkout")
+async def create_checkout(body: CheckoutBody):
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(503, "Billing is not configured")
+    price_id = _stripe_price_id(body.plan)
+    if not price_id:
+        raise HTTPException(503, f"Billing is not configured for the {body.plan.title()} plan")
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=f"{FRONTEND_URL}/pricing?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{FRONTEND_URL}/pricing?checkout=cancelled",
+            metadata={"workspace_id": USER_ID, "plan": body.plan},
+            subscription_data={"metadata": {"workspace_id": USER_ID, "plan": body.plan}},
+        )
+    except stripe.StripeError:
+        logger.exception("Could not create Stripe Checkout session")
+        raise HTTPException(502, "Could not start checkout. Please try again.")
+    return {"url": session.url}
+
+
+@api.post("/billing/portal")
+async def create_billing_portal():
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(503, "Billing is not configured")
+    settings = await db.settings.find_one({"user_id": USER_ID}) or {}
+    customer_id = str((settings.get("billing_subscription") or {}).get("customer_id") or "")
+    if not customer_id:
+        raise HTTPException(404, "No Stripe subscription is attached to this workspace")
+    try:
+        session = stripe.billing_portal.Session.create(customer=customer_id, return_url=f"{FRONTEND_URL}/pricing")
+    except stripe.StripeError:
+        logger.exception("Could not create Stripe Billing Portal session")
+        raise HTTPException(502, "Could not open billing management. Please try again.")
+    return {"url": session.url}
+
+
+@api.post("/billing/webhook")
+async def stripe_webhook(request: Request):
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(503, "Billing webhook is not configured")
+    payload = await request.body()
+    signature = request.headers.get("stripe-signature", "")
+    try:
+        event = stripe.Webhook.construct_event(payload, signature, STRIPE_WEBHOOK_SECRET)
+    except (ValueError, stripe.error.SignatureVerificationError):
+        raise HTTPException(400, "Invalid Stripe webhook signature")
+
+    event_type = event.get("type")
+    data = event.get("data", {}).get("object", {})
+    if event_type == "checkout.session.completed" and data.get("mode") == "subscription":
+        subscription_id = data.get("subscription")
+        if subscription_id:
+            subscription = stripe.Subscription.retrieve(subscription_id)
+            await _apply_stripe_subscription(subscription, data.get("customer"))
+    elif event_type in {"customer.subscription.updated", "customer.subscription.deleted"}:
+        await _apply_stripe_subscription(data)
+    return {"received": True}
 
 
 # ---------- TRAINING LAB ----------
