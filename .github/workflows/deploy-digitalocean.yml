@@ -1,0 +1,112 @@
+name: Deploy backend to DigitalOcean
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: DigitalOcean region slug
+        required: true
+        default: nyc1
+      droplet_name:
+        description: Droplet name
+        required: true
+        default: klippd-backend
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      MONGO_URL: ${{ secrets.MONGO_URL }}
+      MASTER_ENCRYPTION_KEY: ${{ secrets.MASTER_ENCRYPTION_KEY }}
+      SEED_GROQ_KEY: ${{ secrets.SEED_GROQ_KEY }}
+      SEED_CEREBRAS_KEY: ${{ secrets.SEED_CEREBRAS_KEY }}
+      CORS_ORIGINS: https://klippdstudio.com,https://www.klippdstudio.com
+    steps:
+      - uses: actions/checkout@v4
+      - uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      - name: Validate required secrets
+        run: |
+          test -n "$MONGO_URL"
+          test -n "$MASTER_ENCRYPTION_KEY"
+          test -n "${{ secrets.DROPLET_SSH_PRIVATE_KEY }}"
+      - name: Configure deployment SSH key
+        id: ssh_key
+        shell: bash
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' '${{ secrets.DROPLET_SSH_PRIVATE_KEY }}' > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keygen -y -f ~/.ssh/id_ed25519 > ~/.ssh/id_ed25519.pub
+          KEY_ID=$(doctl compute ssh-key list --format ID,Name --no-header | awk '$2 == "klippd-github-deploy" { print $1; exit }')
+          if [ -z "$KEY_ID" ]; then
+            KEY_ID=$(doctl compute ssh-key create klippd-github-deploy --public-key "$(cat ~/.ssh/id_ed25519.pub)" --format ID --no-header)
+          fi
+          echo "id=$KEY_ID" >> "$GITHUB_OUTPUT"
+      - name: Create or find Droplet
+        id: droplet
+        shell: bash
+        run: |
+          NAME='${{ inputs.droplet_name }}'
+          ID=$(doctl compute droplet list --format ID,Name --no-header | awk -v name="$NAME" '$2 == name { print $1; exit }')
+          if [ -z "$ID" ]; then
+            ID=$(doctl compute droplet create "$NAME" --region '${{ inputs.region }}' --image ubuntu-24-04-x64 --size s-2vcpu-4gb --ssh-keys '${{ steps.ssh_key.outputs.id }}' --tag-names klippdstudio --format ID --no-header)
+          fi
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+      - name: Wait for public IP
+        id: host
+        shell: bash
+        run: |
+          for attempt in {1..60}; do
+            IP=$(doctl compute droplet get '${{ steps.droplet.outputs.id }}' --format Status,PublicIPv4 --no-header | awk '$1 == "active" { print $2 }')
+            if [ -n "$IP" ]; then
+              echo "ip=$IP" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo 'Droplet did not become active in time.' >&2
+          exit 1
+      - name: Deploy backend
+        shell: bash
+        run: |
+          cat > /tmp/klippd.env <<EOF
+          MONGO_URL=$MONGO_URL
+          DB_NAME=klipped
+          MASTER_ENCRYPTION_KEY=$MASTER_ENCRYPTION_KEY
+          CORS_ORIGINS=$CORS_ORIGINS
+          SEED_GROQ_KEY=$SEED_GROQ_KEY
+          SEED_CEREBRAS_KEY=$SEED_CEREBRAS_KEY
+          DATA_DIR=/app/data
+          EOF
+          chmod 600 /tmp/klippd.env
+          for attempt in {1..30}; do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@'${{ steps.host.outputs.ip }}' true; then break; fi
+            sleep 10
+          done
+          scp -o StrictHostKeyChecking=no /tmp/klippd.env root@'${{ steps.host.outputs.ip }}':/root/klippd.env
+          ssh -o StrictHostKeyChecking=no root@'${{ steps.host.outputs.ip }}' 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          apt-get update
+          apt-get install -y git docker.io
+          systemctl enable --now docker
+          if [ ! -d /opt/klippdstudio/.git ]; then
+            git clone https://github.com/orbitwebsites-cloud/klippdstudio.git /opt/klippdstudio
+          else
+            git -C /opt/klippdstudio fetch origin main
+            git -C /opt/klippdstudio reset --hard origin/main
+          fi
+          mkdir -p /opt/klippd/data
+          install -m 600 /root/klippd.env /opt/klippd/klippd.env
+          docker rm -f klippd-backend 2>/dev/null || true
+          docker build -f /opt/klippdstudio/backend/Dockerfile -t klippd-backend /opt/klippdstudio
+          docker run -d --name klippd-backend --restart unless-stopped --env-file /opt/klippd/klippd.env -v /opt/klippd/data:/app/data -p 8000:8000 klippd-backend
+          REMOTE
+          rm -f /tmp/klippd.env
+      - name: Verify health endpoint
+        run: curl --fail --retry 12 --retry-delay 5 "http://${{ steps.host.outputs.ip }}:8000/api/health"
