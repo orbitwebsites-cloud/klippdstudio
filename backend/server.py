@@ -124,6 +124,7 @@ def require_plan(required_plan: str) -> None:
     if PLAN_RANK[current_plan] < PLAN_RANK[required_plan]:
         raise HTTPException(403, f"This feature requires the {required_plan.title()} plan or higher")
 
+
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 logger = logging.getLogger("backend")
@@ -589,6 +590,7 @@ async def create_checkout(body: CheckoutBody):
         session = stripe.checkout.Session.create(
             mode="subscription",
             line_items=[{"price": price_id, "quantity": 1}],
+            allow_promotion_codes=True,
             success_url=f"{FRONTEND_URL}/pricing?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{FRONTEND_URL}/pricing?checkout=cancelled",
             metadata={"workspace_id": USER_ID, "plan": body.plan},
