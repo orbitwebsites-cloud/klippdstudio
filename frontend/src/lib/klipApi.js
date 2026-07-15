@@ -1,11 +1,18 @@
 import axios from "axios";
 
-const BACKEND_URL = (process.env.REACT_APP_BACKEND_URL || window.location.origin).replace(/\/$/, "");
+// Production is served separately from the API. Keep an explicit fallback so a
+// missing build variable cannot send API requests to the static Vercel site.
+const BACKEND_URL = (process.env.REACT_APP_BACKEND_URL || "https://api.klippdstudio.com").replace(/\/$/, "");
 export const API = `${BACKEND_URL}/api`;
 
 const api = axios.create({ baseURL: API, timeout: 60000 });
 
-export const listProjects = () => api.get("/projects").then((r) => r.data);
+export const listProjects = () => api.get("/projects").then((r) => {
+    if (!Array.isArray(r.data)) {
+        throw new Error("The server returned an invalid projects response.");
+    }
+    return r.data;
+});
 export const getProject = (id) => api.get(`/projects/${id}`).then((r) => r.data);
 export const deleteProject = (id) => api.delete(`/projects/${id}`).then((r) => r.data);
 
