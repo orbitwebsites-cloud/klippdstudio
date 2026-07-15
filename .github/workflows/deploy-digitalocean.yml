@@ -92,8 +92,18 @@ jobs:
           scp -o StrictHostKeyChecking=no /tmp/klippd.env root@'${{ steps.host.outputs.ip }}':/root/klippd.env
           ssh -o StrictHostKeyChecking=no root@'${{ steps.host.outputs.ip }}' 'bash -s' <<'REMOTE'
           set -euo pipefail
-          apt-get update
-          apt-get install -y git docker.io
+          # Ubuntu's first-boot updater can briefly own apt after SSH opens.
+          # Wait/retry instead of failing a freshly created Droplet deployment.
+          cloud-init status --wait 2>/dev/null || true
+          for attempt in {1..30}; do
+            if apt-get update && apt-get install -y git docker.io; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
           systemctl enable --now docker
           if [ ! -d /opt/klippdstudio/.git ]; then
             git clone https://github.com/orbitwebsites-cloud/klippdstudio.git /opt/klippdstudio
