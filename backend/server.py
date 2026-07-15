@@ -233,19 +233,16 @@ async def _apply_stripe_subscription(subscription: Any, customer_id: Optional[st
 
 @app.on_event("startup")
 async def seed_keys_from_env():
-    """If DB has no keys yet, seed from env vars (SEED_*_KEY)."""
-    existing = await db.settings.find_one({"user_id": USER_ID})
-    if existing and existing.get("keys"):
-        logger.info("Keys already present in DB; skipping seed.")
-        return
+    """Fill missing provider credentials from server-managed deployment secrets."""
+    existing = await get_keys()
     seed = {}
-    if os.environ.get("SEED_GROQ_KEY"):
+    if os.environ.get("SEED_GROQ_KEY") and not existing.get("groq"):
         seed["groq"] = os.environ["SEED_GROQ_KEY"]
-    if os.environ.get("SEED_CEREBRAS_KEY"):
+    if os.environ.get("SEED_CEREBRAS_KEY") and not existing.get("cerebras"):
         seed["cerebras"] = os.environ["SEED_CEREBRAS_KEY"]
     if seed:
         await save_keys(seed)
-        logger.info(f"Seeded keys from env: {list(seed.keys())}")
+        logger.info(f"Seeded missing keys from env: {list(seed.keys())}")
 
 
 @app.on_event("startup")
