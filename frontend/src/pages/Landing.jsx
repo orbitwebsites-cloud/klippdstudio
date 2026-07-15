@@ -141,7 +141,7 @@ export default function Landing({ backendOnline }) {
                 <div className="max-w-6xl">
                     <div className="font-mono text-xs text-[#ccff00] tracking-widest mb-6 flex items-center gap-2">
                         <span className="w-2 h-2 bg-[#ccff00] pulse-brand" />
-                        3K EDITS · 0$ COST · POWERED BY GROQ + CEREBRAS
+                        AI-GUIDED EDITING · CAPTIONS · B-ROLL · SMART CUTS
                     </div>
                     <h1 className="font-heading text-6xl md:text-[8rem] leading-[0.9] tracking-tight">
                         DROP<br />THE VID.<br />
