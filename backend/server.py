@@ -8,13 +8,13 @@ Endpoints:
   GET    /api/projects/{id}            Project details
   DELETE /api/projects/{id}            Delete
   POST   /api/projects/{id}/analyze    Transcribe + LLM analyze (background)
-  GET    /api/projects/{id}/broll_search  Fetch Pixabay results per moment
+  GET    /api/projects/{id}/broll_search  Resolve approved niche-pack assets
   POST   /api/projects/{id}/render     Render final video (background)
   GET    /api/projects/{id}/download   Serve final MP4
   GET    /api/media/original/{id}      Stream original video
   GET    /api/media/output/{id}        Stream output video
 """
-from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -38,8 +38,12 @@ from urllib.parse import urlparse
 
 import ai_services as ai
 import asset_generator
+from asset_pack_manager import AssetPackManager, AssetPolicyError, sha256_file
+from asset_provider_orchestrator import AssetProviderOrchestrator, rank_pack_assets
 import video_processor as vp
+import post_render_qa
 from local_store import LocalDatabase
+from premium_features import register_premium_routes
 
 
 # ---------- BOOTSTRAP ----------
@@ -49,8 +53,11 @@ load_dotenv(ROOT_DIR / ".env")
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(ROOT_DIR.parent / "data"))).resolve()
 SFX_DIR = os.environ.get("SFX_DIR", str(ROOT_DIR / "assets" / "sfx"))
 LIBRARY_DIR = DATA_DIR / "library"
+ASSET_QUARANTINE_DIR = DATA_DIR / "quarantine"
 for sub in ("videos", "audio", "output", "subtitles", "broll", "library"):
     (DATA_DIR / sub).mkdir(parents=True, exist_ok=True)
+ASSET_MANAGER = AssetPackManager(LIBRARY_DIR, ASSET_QUARANTINE_DIR)
+ASSET_ORCHESTRATOR = AssetProviderOrchestrator(ASSET_MANAGER)
 
 mongo_url = os.environ.get("MONGO_URL", "").strip()
 if mongo_url:
@@ -153,8 +160,6 @@ async def seed_keys_from_env():
         seed["groq"] = os.environ["SEED_GROQ_KEY"]
     if os.environ.get("SEED_CEREBRAS_KEY"):
         seed["cerebras"] = os.environ["SEED_CEREBRAS_KEY"]
-    if os.environ.get("SEED_PIXABAY_KEY"):
-        seed["pixabay"] = os.environ["SEED_PIXABAY_KEY"]
     if seed:
         await save_keys(seed)
         logger.info(f"Seeded keys from env: {list(seed.keys())}")
@@ -165,7 +170,6 @@ class KeysBody(BaseModel):
     model_config = ConfigDict(extra="ignore")
     groq: Optional[str] = None
     cerebras: Optional[str] = None
-    pixabay: Optional[str] = None
 
 
 class RenderOptions(BaseModel):
@@ -195,6 +199,33 @@ class RenderOptions(BaseModel):
         return self
 
 
+class AnalyzeBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    requested_profile: Optional[Literal["general", "gaming", "minecraft_narrative", "talking_head"]] = None
+    training_profile_id: Optional[str] = Field(default=None, max_length=64)
+
+
+class TrainingReferenceBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    title: str = Field(min_length=2, max_length=120)
+    source_url: Optional[str] = Field(default=None, max_length=500)
+    niche: str = Field(default="gaming", min_length=2, max_length=40)
+    game: Optional[str] = Field(default=None, max_length=60)
+    rights_status: Literal["owned", "licensed", "research_only"]
+    notes: str = Field(min_length=20, max_length=3000)
+    principles: List[str] = Field(default_factory=list, max_length=8)
+
+
+class TrainingProfileBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: str = Field(min_length=2, max_length=80)
+    niche: str = Field(default="gaming", min_length=2, max_length=40)
+    game: Optional[str] = Field(default=None, max_length=60)
+    base_profile: Literal["general", "gaming", "minecraft_narrative", "talking_head"] = "gaming"
+    reference_ids: List[str] = Field(default_factory=list, max_length=50)
+    principles: List[str] = Field(default_factory=list, min_length=1, max_length=12)
+
+
 # ---------- HELPERS ----------
 async def update_project(pid: str, **fields) -> None:
     fields["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -206,6 +237,33 @@ async def get_project(pid: str) -> Dict:
     if not doc:
         raise HTTPException(404, "Project not found")
     return doc
+
+
+def _clean_training_principles(values: List[str]) -> List[str]:
+    """Keep a small, human-reviewable set of general editing principles."""
+    cleaned = []
+    for value in values:
+        item = re.sub(r"\s+", " ", str(value)).strip()
+        if len(item) < 12:
+            continue
+        if re.search(r"\b(copy|clone|imitate|exactly like)\b", item, re.IGNORECASE):
+            raise HTTPException(400, "Use general editing principles, not creator imitation instructions")
+        if item not in cleaned:
+            cleaned.append(item[:360])
+    return cleaned
+
+
+async def _training_context(profile_id: Optional[str]) -> tuple[Optional[Dict[str, Any]], str]:
+    if not profile_id:
+        return None, ""
+    profile = await db.training_profiles.find_one({"id": profile_id, "user_id": USER_ID}, {"_id": 0})
+    if not profile:
+        raise HTTPException(404, "Training profile not found")
+    if profile.get("status") != "active":
+        raise HTTPException(400, "Activate this training profile before using it on an edit")
+    principles = profile.get("principles", [])
+    context = "\n".join(f"- {rule}" for rule in principles)
+    return profile, context
 
 
 async def _save_upload(file: UploadFile, destination: Path, max_bytes: int) -> int:
@@ -273,7 +331,6 @@ async def keys_status():
     return {
         "groq": bool(keys.get("groq")),
         "cerebras": bool(keys.get("cerebras")),
-        "pixabay": bool(keys.get("pixabay")),
     }
 
 
@@ -289,12 +346,89 @@ async def set_keys(body: KeysBody):
 @api.post("/keys/test")
 async def test_keys():
     k = await get_keys()
-    g, c, pb = await asyncio.gather(
+    g, c = await asyncio.gather(
         ai.test_groq(k.get("groq", "")),
         ai.test_cerebras(k.get("cerebras", "")),
-        ai.test_pixabay(k.get("pixabay", "")),
     )
-    return {"groq": g, "cerebras": c, "pixabay": pb}
+    return {"groq": g, "cerebras": c}
+
+
+# ---------- TRAINING LAB ----------
+@api.get("/training/dashboard")
+async def training_dashboard():
+    references = await db.training_references.find({"user_id": USER_ID}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    profiles = await db.training_profiles.find({"user_id": USER_ID}, {"_id": 0}).sort("updated_at", -1).to_list(100)
+    return {
+        "policy": "References are editorial research and annotations, not uploaded creator footage or model fine-tuning data.",
+        "references": references,
+        "profiles": profiles,
+        "stats": {
+            "references": len(references),
+            "active_profiles": sum(1 for profile in profiles if profile.get("status") == "active"),
+            "approved_principles": sum(len(profile.get("principles", [])) for profile in profiles),
+        },
+    }
+
+
+@api.post("/training/references")
+async def create_training_reference(body: TrainingReferenceBody):
+    if body.source_url:
+        parsed = urlparse(body.source_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise HTTPException(400, "Reference link must be a valid http(s) URL")
+    principles = _clean_training_principles(body.principles)
+    record = {
+        "id": f"ref_{uuid.uuid4().hex[:12]}", "user_id": USER_ID,
+        "title": body.title.strip(), "source_url": body.source_url.strip() if body.source_url else None,
+        "niche": body.niche.strip().lower(), "game": body.game.strip() if body.game else None,
+        "rights_status": body.rights_status, "notes": body.notes.strip(), "principles": principles,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.training_references.insert_one(record)
+    return record
+
+
+@api.post("/training/profiles")
+async def create_training_profile(body: TrainingProfileBody):
+    principles = _clean_training_principles(body.principles)
+    reference_ids = list(dict.fromkeys(body.reference_ids))
+    valid_references = []
+    for ref_id in reference_ids:
+        reference = await db.training_references.find_one({"id": ref_id, "user_id": USER_ID}, {"_id": 0})
+        if not reference:
+            raise HTTPException(400, "One or more selected references no longer exist")
+        valid_references.append(reference)
+    # References contribute only the author's explicit, reviewable principles.
+    # We never ingest video frames, copied timelines, or creator identity data.
+    principles = _clean_training_principles([
+        *principles,
+        *(rule for reference in valid_references for rule in reference.get("principles", [])),
+    ])
+    if not principles:
+        raise HTTPException(400, "Add at least one usable editorial principle")
+    record = {
+        "id": f"profile_{uuid.uuid4().hex[:12]}", "user_id": USER_ID,
+        "name": body.name.strip(), "niche": body.niche.strip().lower(), "game": body.game.strip() if body.game else None,
+        "base_profile": body.base_profile, "reference_ids": reference_ids, "principles": principles,
+        "reference_count": len(valid_references), "status": "draft",
+        "created_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.training_profiles.insert_one(record)
+    return record
+
+
+@api.post("/training/profiles/{profile_id}/activate")
+async def activate_training_profile(profile_id: str):
+    profile = await db.training_profiles.find_one({"id": profile_id, "user_id": USER_ID}, {"_id": 0})
+    if not profile:
+        raise HTTPException(404, "Training profile not found")
+    if len(profile.get("principles", [])) < 3:
+        raise HTTPException(400, "Add at least 3 approved principles before activation")
+    await db.training_profiles.update_one({"id": profile_id, "user_id": USER_ID}, {"$set": {
+        "status": "active", "activated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }})
+    return {"ok": True, "profile_id": profile_id, "status": "active"}
 
 
 # ---------- ROUTES: PROJECTS ----------
@@ -566,8 +700,24 @@ async def _run_analysis(pid: str):
                              status="analyzing",
                              status_message="AI analyzing for fillers, emphasis, B-roll...")
 
-        profile = os.environ.get("EDITING_PROFILE", "")
-        analysis = await ai.analyze_transcript(transcript.get("words", []), keys, profile=profile)
+        # A selected Training Lab profile is an explicit user choice. Otherwise
+        # retain per-project niche inference instead of applying a global style.
+        requested_profile = proj.get("requested_profile")
+        training_profile, training_context = await _training_context(proj.get("training_profile_id"))
+        if training_profile:
+            requested_profile = training_profile.get("base_profile", requested_profile)
+        analysis_options = {"profile": requested_profile}
+        if training_context:
+            analysis_options["training_context"] = training_context
+        analysis = await ai.analyze_transcript(
+            transcript.get("words", []), keys, **analysis_options,
+        )
+        if training_profile:
+            analysis["training_profile"] = {
+                "id": training_profile["id"], "name": training_profile["name"],
+                "niche": training_profile["niche"], "game": training_profile.get("game"),
+                "principle_count": len(training_profile.get("principles", [])),
+            }
         quality_review = analysis.get("quality_review", {})
         if not quality_review.get("passed"):
             issue_codes = [
@@ -588,10 +738,78 @@ async def _run_analysis(pid: str):
             return
         await update_project(pid, progress=82,
                              status_message="Building the edit plan and missing graphics...")
+        pack_resolution = await ASSET_ORCHESTRATOR.resolve(
+            quality_review.get("profile", "general"),
+            [
+                str(moment.get("query", ""))
+                for moment in analysis.get("broll_moments", [])
+                if isinstance(moment, dict)
+            ],
+        )
+        analysis["asset_pack_resolution"] = {
+            "source": pack_resolution.get("source"),
+            "pack_id": pack_resolution.get("pack_id"),
+            "pack_ids": pack_resolution.get("pack_ids", []),
+            "counts": pack_resolution.get("counts", {}),
+            "asset_count": len(pack_resolution.get("assets", [])),
+        }
+        pack_assets = pack_resolution.get("assets", [])
+        moments_by_index = {
+            int(moment.get("word_index", 0)): moment
+            for moment in analysis.get("broll_moments", [])
+            if isinstance(moment, dict)
+        }
+        resolved_pack_assets = []
+        matched_request_indices = set()
+        for request in analysis.get("asset_requests", []):
+            word_index = int(request.get("word_index", 0))
+            moment = moments_by_index.get(word_index, {})
+            # Retrieval terms come from the explicit asset query. Broader
+            # visual-intent prose can contain incidental words (for example
+            # "UI") that would create a false semantic match.
+            intent = str(moment.get("query", "")).strip() or " ".join(filter(None, [
+                str(request.get("text", "")), str(request.get("subtext", "")),
+                str(request.get("kind", "")).replace("_", " "),
+            ]))
+            match = rank_pack_assets(pack_assets, intent, limit=1)
+            if not match:
+                continue
+            record = match[0]
+            path = ASSET_MANAGER.resolve_renderable(LIBRARY_DIR / record["name"])
+            if not path:
+                continue
+            resolved_pack_assets.append({
+                "id": f"pack_{record['sha256'][:16]}_{word_index}",
+                "name": record.get("original_name") or record["name"],
+                "word_index": word_index, "provider": record["source_id"],
+                "url": f"/api/library/file/{record['name']}", "video_url": f"file://{path}",
+                "local_path": str(path), "thumbnail": f"/api/library/thumb/{record['name']}",
+                "is_custom": False, "generated": False, "pack_id": record.get("pack_id"),
+                "sha256": record["sha256"], "matched_terms": record.get("matched_terms", []),
+            })
+            matched_request_indices.add(word_index)
+        analysis["resolved_pack_assets"] = resolved_pack_assets
+        generation_requests = [
+            request for request in analysis.get("asset_requests", [])
+            if int(request.get("word_index", 0)) not in matched_request_indices
+        ]
         generated_assets = await asyncio.to_thread(
             asset_generator.generate_assets,
-            analysis.get("asset_requests", []), pid, LIBRARY_DIR,
+            generation_requests, pid, LIBRARY_DIR,
+            quality_review.get("profile", "general"),
         )
+        approved_generated_assets = []
+        for asset in generated_assets:
+            try:
+                await asyncio.to_thread(
+                    ASSET_MANAGER.register_generated,
+                    Path(asset["local_path"]), asset,
+                )
+                approved_generated_assets.append(asset)
+            except AssetPolicyError as exc:
+                Path(asset.get("local_path", "")).unlink(missing_ok=True)
+                logger.error("Generated asset failed rights/byte registration: %s", exc)
+        generated_assets = approved_generated_assets
         analysis["generated_assets"] = generated_assets
         # A generated graphic must always have a visible picker moment even if
         # the model returned slightly mismatched arrays.
@@ -613,18 +831,24 @@ async def _run_analysis(pid: str):
 
 
 @api.post("/projects/{pid}/analyze")
-async def analyze(pid: str, bg: BackgroundTasks):
+async def analyze(pid: str, bg: BackgroundTasks, body: Optional[AnalyzeBody] = None):
     proj = await get_project(pid)
     if proj["status"] in ("transcribing", "analyzing", "extracting_audio", "rendering"):
         return {"ok": True, "status": proj["status"], "already_running": True}
-    await update_project(pid, status="queued", status_message="Queued for analysis...", progress=1)
+    body = body or AnalyzeBody()
+    if body.training_profile_id:
+        await _training_context(body.training_profile_id)
+    await update_project(
+        pid, status="queued", status_message="Queued for analysis...", progress=1,
+        requested_profile=body.requested_profile, training_profile_id=body.training_profile_id,
+    )
     bg.add_task(_run_analysis, pid)
     return {"ok": True, "status": "queued"}
 
 
 # ---------- ASSET LIBRARY (user's own vault) ----------
-LIBRARY_EXTS_VIDEO = {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi", ".gif"}
-LIBRARY_EXTS_IMAGE = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".svg"}
+LIBRARY_EXTS_VIDEO = {".mp4", ".mov", ".webm"}
+LIBRARY_EXTS_IMAGE = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 LIBRARY_EXTS_ALL = LIBRARY_EXTS_VIDEO | LIBRARY_EXTS_IMAGE
 
 
@@ -639,34 +863,36 @@ def _asset_kind(name: str) -> str:
 async def library_list():
     """List all assets in the user's personal library."""
     items = []
-    for p in sorted(LIBRARY_DIR.glob("*")):
-        if not p.is_file():
-            continue
-        ext = p.suffix.lower()
-        if ext not in LIBRARY_EXTS_ALL:
-            continue
-        try:
-            stat = p.stat()
-        except Exception:
-            continue
+    for record in ASSET_MANAGER.published_records():
+        p = LIBRARY_DIR / record["name"]
         aid = p.stem
         items.append({
             "id": f"lib_{aid}",
             "name": p.name,
             "kind": _asset_kind(p.name),
-            "size": stat.st_size,
+            "size": record["size"],
             "url": f"/api/library/file/{p.name}",
             "video_url": f"file://{p}",
             "local_path": str(p),
             "thumbnail": f"/api/library/thumb/{p.name}" if _asset_kind(p.name) == "image" else None,
             "is_custom": True,
             "provider": "library",
+            "sha256": record["sha256"],
+            "rights_status": record["rights_status"],
+            "license_id": record["license_id"],
+            "provenance": record["provenance"],
+            "is_evidence": record.get("is_evidence", False),
         })
     return {"items": items}
 
 
 @api.post("/library/upload")
-async def library_upload(file: UploadFile = File(...)):
+async def library_upload(
+    file: UploadFile = File(...),
+    rights_status: str = Form("unknown"),
+    rights_attestation: str = Form(""),
+    license_id: str = Form(""),
+):
     """Upload a single asset to the personal library."""
     fname = file.filename or "asset"
     ext = os.path.splitext(fname)[1].lower()
@@ -674,24 +900,41 @@ async def library_upload(file: UploadFile = File(...)):
         raise HTTPException(400, f"Unsupported asset type: {ext}")
     # Sanitize name
     stem = re.sub(r"[^\w.-]+", "_", os.path.splitext(fname)[0])[:60] or "asset"
-    # Ensure unique
-    candidate = LIBRARY_DIR / f"{stem}{ext}"
-    i = 1
-    while candidate.exists():
-        candidate = LIBRARY_DIR / f"{stem}_{i}{ext}"
-        i += 1
+    incoming = ASSET_QUARANTINE_DIR / "incoming" / uuid.uuid4().hex
+    incoming.mkdir(parents=True, exist_ok=True)
+    candidate = incoming / f"{stem}{ext}"
     total = await _save_upload(file, candidate, MAX_ASSET_BYTES)
-    return {"ok": True, "name": candidate.name, "size": total, "kind": _asset_kind(candidate.name)}
+    attested = rights_attestation.strip() == "I own or have commercial rights to this asset"
+    effective_rights = "user_owned_attested" if rights_status == "user_owned_attested" and attested else "unknown"
+    mime_type = (file.content_type or mimetypes.guess_type(candidate.name)[0] or "application/octet-stream").lower()
+    entry = {
+        "asset_id": uuid.uuid4().hex, "source_id": "user_owned_gaming",
+        "relative_path": candidate.name, "sha256": sha256_file(candidate),
+        "mime_type": mime_type, "rights_status": effective_rights,
+        "license_id": license_id.strip() or ("user-attestation" if attested else "unknown"),
+        "provenance": "direct_user_upload", "attribution": "User supplied",
+        "niche": "gaming", "is_evidence": attested,
+        "tags": [token.lower() for token in re.findall(r"[A-Za-z0-9]+", stem)[:12]],
+    }
+    try:
+        record = await asyncio.to_thread(
+            ASSET_MANAGER.ingest_file, incoming, entry,
+            {"max_files": 250, "max_file_bytes": MAX_ASSET_BYTES, "max_total_bytes": 1024 * 1024 * 1024},
+            audit_sample_rate=0,
+        )
+    except AssetPolicyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if record.get("status") != "published":
+        return {"ok": False, "status": "quarantined", "reason": record.get("reason"), "rights_proof_required": True}
+    return {"ok": True, "name": record["name"], "size": record["size"], "kind": _asset_kind(record["name"]), "sha256": record["sha256"]}
 
 
 @api.delete("/library/{name}")
 async def library_delete(name: str):
     """Delete an asset from the library (safe against path traversal)."""
     safe = os.path.basename(name)
-    p = LIBRARY_DIR / safe
-    if not p.exists() or not p.is_file():
+    if not ASSET_MANAGER.delete(safe):
         raise HTTPException(404)
-    p.unlink()
     return {"ok": True}
 
 
@@ -699,12 +942,14 @@ async def library_delete(name: str):
 async def library_file(name: str):
     """Serve a library file for preview."""
     safe = os.path.basename(name)
-    p = LIBRARY_DIR / safe
-    if not p.exists() or not p.is_file():
+    p = ASSET_MANAGER.resolve_renderable(LIBRARY_DIR / safe)
+    if not p:
         raise HTTPException(404)
     kind = _asset_kind(safe)
     media_type = "video/mp4" if kind == "video" else "image/jpeg"
-    if safe.lower().endswith(".png"): media_type = "image/png"
+    if safe.lower().endswith(".mov"): media_type = "video/quicktime"
+    elif safe.lower().endswith(".webm"): media_type = "video/webm"
+    elif safe.lower().endswith(".png"): media_type = "image/png"
     elif safe.lower().endswith(".webp"): media_type = "image/webp"
     elif safe.lower().endswith(".gif"): media_type = "image/gif"
     elif safe.lower().endswith(".svg"): media_type = "image/svg+xml"
@@ -717,29 +962,58 @@ async def library_thumb(name: str):
     return await library_file(name)
 
 
+@api.get("/asset-packs/status")
+async def asset_pack_status():
+    return ASSET_ORCHESTRATOR.status()
+
+
+@api.post("/asset-packs/resolve")
+async def asset_pack_resolve(niche: str = "gaming", tags: str = ""):
+    selected_tags = [item.strip() for item in tags.split(",") if item.strip()]
+    return await ASSET_ORCHESTRATOR.resolve(niche, selected_tags)
+
+
 # ---------- B-ROLL SEARCH ----------
 @api.get("/projects/{pid}/broll_search")
 async def broll_search(pid: str, query: str, per_page: int = 6, orientation: str = "landscape"):
-    """Search Pixabay for stock B-roll clips."""
+    """Resolve rights-approved niche-pack assets; arbitrary stock is disabled."""
     await get_project(pid)
     query = re.sub(r"\s+", " ", query).strip()[:80]
     if not query:
         raise HTTPException(400, "Search query is required")
-    keys = await get_keys()
-    pb_orient = "vertical" if orientation == "vertical" else "horizontal"
-    results = await ai.search_pixabay_video(query, keys.get("pixabay", ""), per_page=per_page, orientation=pb_orient)
-    return {"query": query, "results": results, "counts": {"pixabay": len(results)}}
+    resolution = await ASSET_ORCHESTRATOR.resolve("gaming", query.split())
+    results = []
+    ranked_assets = rank_pack_assets(resolution.get("assets", []), query, limit=max(1, min(per_page, 20)))
+    for record in ranked_assets:
+        path = ASSET_MANAGER.resolve_renderable(LIBRARY_DIR / record["name"])
+        if not path or _asset_kind(record["name"]) not in {"image", "video"}:
+            continue
+        results.append({
+            "id": f"pack_{record['sha256'][:16]}", "provider": record["source_id"],
+            "name": record["name"], "video_url": f"file://{path}", "local_path": str(path),
+            "thumbnail": f"/api/library/thumb/{record['name']}" if _asset_kind(record["name"]) == "image" else None,
+            "is_custom": False, "pack_id": record.get("pack_id"), "sha256": record["sha256"],
+        })
+    return {"query": query, "results": results, "counts": {"approved_pack": len(results)}, "resolution_source": resolution["source"]}
 
 
 @api.post("/projects/{pid}/broll_upload")
-async def broll_upload(pid: str, file: UploadFile = File(...)):
+async def broll_upload(
+    pid: str,
+    file: UploadFile = File(...),
+    rights_status: str = Form("unknown"),
+    rights_attestation: str = Form(""),
+    license_id: str = Form(""),
+):
     """Accept a user-uploaded B-roll clip for use in a render."""
     await get_project(pid)  # validate exists
     ext = os.path.splitext(file.filename or "clip.mp4")[1].lower() or ".mp4"
-    if ext not in {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi"}:
+    if ext not in LIBRARY_EXTS_VIDEO:
         raise HTTPException(400, f"Unsupported B-roll type: {ext}")
     clip_id = f"user_{uuid.uuid4().hex[:8]}"
-    dst = DATA_DIR / "broll" / f"{pid}_{clip_id}{ext}"
+    incoming = ASSET_QUARANTINE_DIR / "incoming" / uuid.uuid4().hex
+    incoming.mkdir(parents=True, exist_ok=True)
+    dst = incoming / f"{pid}_{clip_id}{ext}"
 
     total = await _save_upload(file, dst, MAX_ASSET_BYTES)
 
@@ -749,19 +1023,48 @@ async def broll_upload(pid: str, file: UploadFile = File(...)):
         dst.unlink(missing_ok=True)
         raise HTTPException(400, f"Could not read B-roll: {str(e)[:200]}")
 
-    # Return the same shape used by the asset picker; the renderer reads this path directly.
-    backend_base = os.environ.get("PUBLIC_BACKEND_URL", "").rstrip("/")
-    video_url = f"file://{dst}"  # Backend can read local file:// directly
+    attested = (
+        rights_status == "user_owned_attested"
+        and rights_attestation.strip() == "I own or have commercial rights to this asset"
+    )
+    entry = {
+        "asset_id": clip_id, "source_id": "user_owned_gaming", "relative_path": dst.name,
+        "sha256": sha256_file(dst),
+        "mime_type": (file.content_type or mimetypes.guess_type(dst.name)[0] or "application/octet-stream").lower(),
+        "rights_status": "user_owned_attested" if attested else "unknown",
+        "license_id": license_id.strip() or ("user-attestation" if attested else "unknown"),
+        "provenance": "direct_user_upload", "attribution": "User supplied",
+        "niche": "gaming", "is_evidence": attested,
+        "tags": [token.lower() for token in re.findall(r"[A-Za-z0-9]+", file.filename or "")[:12]],
+    }
+    try:
+        record = await asyncio.to_thread(
+            ASSET_MANAGER.ingest_file, incoming, entry,
+            {"max_files": 250, "max_file_bytes": MAX_ASSET_BYTES, "max_total_bytes": 1024 * 1024 * 1024},
+            audit_sample_rate=0,
+        )
+    except AssetPolicyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if record.get("status") != "published":
+        return {"ok": False, "status": "quarantined", "reason": record.get("reason"), "rights_proof_required": True}
+    published = ASSET_MANAGER.resolve_renderable(LIBRARY_DIR / record["name"])
+    if not published:
+        raise HTTPException(400, "Asset registration failed closed")
+    video_url = f"file://{published}"
     return {
+        "ok": True,
         "id": clip_id,
         "duration": meta.get("duration", 0),
         "thumbnail": None,
         "video_url": video_url,
-        "local_path": str(dst),
+        "local_path": str(published),
         "width": meta.get("width", 0),
         "height": meta.get("height", 0),
         "user": "You",
         "is_custom": True,
+        "sha256": record["sha256"],
+        "rights_status": record["rights_status"],
+        "license_id": record["license_id"],
     }
 
 
@@ -851,29 +1154,14 @@ async def _run_render(pid: str, opts: RenderOptions):
                 moment_word_idx = int(sel.get("word_index", 0))
                 if not url:
                     continue
-                # Handle custom (already-local) versus a remote Pixabay clip.
-                if url.startswith("file://") or sel.get("is_custom"):
-                    requested = sel.get("local_path") or url.replace("file://", "")
-                    local = _safe_data_file(requested)
-                    if not local:
-                        logger.warning("Rejected unsafe or missing local asset for project %s", pid)
-                        continue
-                else:
-                    parsed_url = urlparse(url)
-                    host = (parsed_url.hostname or "").lower()
-                    if parsed_url.scheme != "https" or not (host == "pixabay.com" or host.endswith(".pixabay.com")):
-                        logger.warning("Rejected non-Pixabay B-roll URL for project %s", pid)
-                        continue
-                    local = str(DATA_DIR / "broll" / f"{pid}_broll_{i}.mp4")
-                    ok = await vp.download_broll(url, local, MAX_ASSET_BYTES)
-                    if not ok:
-                        continue
-                    try:
-                        await asyncio.to_thread(vp.probe_video, local)
-                    except Exception:
-                        Path(local).unlink(missing_ok=True)
-                        logger.warning("Rejected unreadable Pixabay clip for project %s", pid)
-                        continue
+                # Never trust client flags or arbitrary DATA_DIR paths. Every
+                # selected asset must resolve through the published registry.
+                requested = sel.get("local_path") or (url[7:] if url.startswith("file://") else "")
+                registered = ASSET_MANAGER.resolve_renderable(requested) if requested else None
+                if not registered:
+                    logger.warning("Rejected unregistered, quarantined, remote, or forged asset for project %s", pid)
+                    continue
+                local = str(registered)
                 # Compute output time from word index remap
                 if moment_word_idx < len(words):
                     orig_t = float(words[moment_word_idx].get("start", 0))
@@ -898,7 +1186,7 @@ async def _run_render(pid: str, opts: RenderOptions):
                     "out_start": max(0, out_t),
                     "out_duration": 3.5,
                     "fit": (
-                        "full" if sel.get("generated") else
+                        "full" if bool(ASSET_MANAGER._index()["assets"].get(Path(local).name, {}).get("generator")) else
                         "pip" if Path(local).suffix.lower() in LIBRARY_EXTS_IMAGE else
                         "cover"
                     ),
@@ -929,8 +1217,18 @@ async def _run_render(pid: str, opts: RenderOptions):
         except Exception:
             pass
 
+        try:
+            render_review = await asyncio.to_thread(
+                post_render_qa.review_render,
+                Path(output_path), Path(ass_path) if ass_path else None,
+                niche=analysis.get("quality_review", {}).get("profile", "general"),
+            )
+        except Exception as exc:
+            render_review = {"schema_version": "klippd.post_render_qa.v1", "passed": False, "hard_fail": True, "issues": [{"code": "review_failed", "detail": str(exc)[:200]}]}
         update_fields = {"status": "done", "progress": 100,
-                         "status_message": "Render complete!", "output_meta": output_meta}
+                         "status_message": "Render complete!", "output_meta": output_meta,
+                         "post_render_qa": render_review,
+                         "render_review_required": not bool(render_review.get("passed"))}
         if opts.clip_label:
             # Track in viral_renders dict on project
             proj_now = await get_project(pid)
@@ -1015,6 +1313,7 @@ async def media_output(pid: str):
 
 
 # ---------- APP WIRING ----------
+register_premium_routes(api, db, USER_ID, get_project, update_project)
 app.include_router(api)
 cors_origins = [origin.strip() for origin in os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",") if origin.strip()]
 app.add_middleware(

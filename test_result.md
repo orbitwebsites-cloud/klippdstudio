@@ -101,3 +101,73 @@
 #====================================================================================================
 # Testing Data - Main Agent and testing sub agent both should log testing data below this section
 #====================================================================================================
+## user_problem_statement: "User reported a bug without reproduction details; identify and repair a concrete failing path."
+## backend:
+  - task: "Baseline backend regression triage"
+    implemented: true
+    working: false
+    file: "backend/"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Opened baseline triage after user reported a bug; reproduction details have not yet been provided."
+      - working: "NA"
+        agent: "main"
+        comment: "Fixed B-roll upload success contract and library preview MIME handling; requires regression testing."
+      - working: false
+        agent: "testing"
+        comment: "Reproduced with python -m pytest -q in backend: 1 failed, 58 passed, 1 skipped. tests/test_asset_api_security.py::test_analysis_uses_semantic_pack_match_and_generates_only_the_unmatched_request fails because server._run_analysis passes training_context to ai.analyze_transcript, but the mocked callable accepts only profile; TypeError causes project status error instead of ready."
+      - working: "NA"
+        agent: "main"
+        comment: "Updated the default analysis call to send training_context only when a training profile supplies it; requires regression testing."
+      - working: true
+        agent: "testing"
+        comment: "Verified with python -m pytest -q in backend: 59 passed, 1 skipped. The B-roll contract test explicitly asserts accepted.json()[\"ok\"] is True and passed."
+## frontend:
+  - task: "Baseline frontend regression triage"
+    implemented: true
+    working: true
+    file: "frontend/"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Opened baseline triage after user reported a bug; reproduction details have not yet been provided."
+      - working: true
+        agent: "testing"
+        comment: "Verified with npm.cmd run build in frontend: CRACO production build compiled successfully. Only a Node fs.F_OK deprecation warning was emitted."
+      - working: false
+        agent: "testing"
+        comment: "npm.cmd run build now fails at ESLint: src/pages/TrainingLab.jsx line 104 calls useProfile inside a callback, violating react-hooks/rules-of-hooks."
+      - working: "NA"
+        agent: "main"
+        comment: "Inspected the current TrainingLab.jsx and found no useProfile reference; request a clean rebuild to confirm whether the reported lint error was stale."
+      - working: true
+        agent: "testing"
+        comment: "Clean production build verified with npm.cmd run build after removing frontend/build: CRACO compiled successfully and produced build/static/js/main.388dc02b.js (134.27 kB gzip) and build/static/css/main.43faac12.css (11.87 kB gzip). The only output besides standard deployment guidance was Node DEP0176 fs.F_OK deprecation warning."
+## metadata:
+  created_by: "main_agent"
+  version: "1.0"
+  test_sequence: 4
+  run_ui: false
+## test_plan:
+  current_focus:
+    - "Baseline backend regression triage"
+    - "Baseline frontend regression triage"
+  stuck_tasks: []
+  test_all: true
+  test_priority: "high_first"
+## agent_communication:
+  - agent: "main"
+    message: "Testing agent: run a clean frontend production build against the current source and record the exact result here."
+  - agent: "testing"
+    message: "Frontend build passes. Backend suite has one reproducible regression: _run_analysis training_context keyword breaks a mocked analyze_transcript call, producing project status error rather than ready."
+  - agent: "testing"
+    message: "Backend regression is green: 59 passed, 1 skipped, including the B-roll upload ok=true assertion. Frontend production build is blocked by an ESLint invalid Hook-call error in src/pages/TrainingLab.jsx:104."
+  - agent: "testing"
+    message: "Clean frontend production build now passes; prior TrainingLab ESLint Hook-call failure is not present in the current source/build."

@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://klippdstudio.com/schemas/asset-pack-manifest-v1.json",
+  "title": "Klipped rights-gated niche asset pack",
+  "type": "object",
+  "required": ["schema_version", "pack_id", "version", "niche", "status", "sources", "assets", "budgets"],
+  "properties": {
+    "schema_version": {"const": "klippd.asset_pack.v1"},
+    "pack_id": {"type": "string", "minLength": 1},
+    "version": {"type": "string", "minLength": 1},
+    "niche": {"type": "string", "minLength": 1},
+    "status": {"enum": ["enabled", "disabled", "review_only"]},
+    "budgets": {
+      "type": "object",
+      "required": ["max_files", "max_file_bytes", "max_total_bytes"],
+      "properties": {
+        "max_files": {"type": "integer", "minimum": 1},
+        "max_file_bytes": {"type": "integer", "minimum": 1},
+        "max_total_bytes": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": false
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["source_id", "priority", "rights_status", "license_id", "provenance", "approval"],
+        "properties": {
+          "source_id": {"type": "string", "minLength": 1},
+          "priority": {"type": "integer", "minimum": 1, "maximum": 4},
+          "rights_status": {"enum": ["user_owned_attested", "cc0_vendored_approved", "oss_vendored_approved", "generated_editorial", "review_only", "unknown", "quarantine_reference_only"]},
+          "license_id": {"type": "string", "minLength": 1},
+          "provenance": {"type": "string", "minLength": 1},
+          "approval": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["asset_id", "source_id", "relative_path", "sha256", "mime_type", "rights_status", "license_id", "provenance"],
+        "properties": {
+          "asset_id": {"type": "string", "minLength": 1},
+          "source_id": {"type": "string", "minLength": 1},
+          "relative_path": {"type": "string", "minLength": 1},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "mime_type": {"type": "string", "minLength": 1},
+          "rights_status": {"type": "string", "minLength": 1},
+          "license_id": {"type": "string", "minLength": 1},
+          "provenance": {"type": "string", "minLength": 1},
+          "attribution": {"type": "string"},
+          "is_evidence": {"type": "boolean"}
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

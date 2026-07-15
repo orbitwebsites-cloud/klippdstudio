@@ -14,6 +14,8 @@ from editing_intelligence import (
 
 
 FIXTURE = Path(__file__).resolve().parents[2] / "training" / "fixtures" / "minecraft_plan_quality_cases.json"
+GAMING_FIXTURE = Path(__file__).resolve().parents[2] / "training" / "fixtures" / "gaming_plan_quality_cases.json"
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _case():
@@ -31,6 +33,90 @@ def test_knowledge_pack_is_valid_and_traceable():
     assert len(ids) == len(set(ids))
     assert "asset-generated-scope" in ids
     assert knowledge["provenance_policy"]["disallowed"]
+    assert any(module["id"] == "gaming" and module["version"] == "1.0.0-prior" for module in knowledge["_knowledge_modules"])
+
+
+def test_gaming_module_is_retrieved_and_version_traced():
+    words = [{"word": "ranked gameplay boss match", "start": 0.0, "end": 1.0}]
+    context = retrieve_editing_context(words, "gaming", max_rules=30)
+    assert "gaming-hook-supported-stake" in context["rule_ids"]
+    assert any(module["id"] == "gaming" and module["version"] == "1.0.0-prior" for module in context["knowledge_modules"])
+
+    plan = {"story_beats": [], "transitions": [], "audio_cues": [], "broll_moments": [], "asset_requests": []}
+    result = quality_gate_edit_plan(plan, words, "gaming")
+    assert result["quality_review"]["threshold"] == 90
+    assert any(module["id"] == "gaming" for module in result["quality_review"]["knowledge_modules"])
+
+
+def test_niche_rules_do_not_leak_into_other_profiles():
+    words = [{"word": "minecraft survival mace", "start": 0.0, "end": 1.0}]
+    context = retrieve_editing_context(words, "minecraft_narrative", max_rules=50)
+    assert not any(rule_id.startswith("gaming-") for rule_id in context["rule_ids"])
+
+
+def test_module_loader_rejects_duplicate_rule_ids(tmp_path, monkeypatch):
+    base = {
+        "schema_version": "klippd.editing_knowledge.v1",
+        "profiles": {"gaming": {"aliases": [], "goal": "", "default_arc": []}},
+        "provenance_policy": {"allowed": [], "disallowed": ["fabrication"]},
+        "rules": [{"id": "same", "tags": ["all"], "rule": "Do one thing.", "rationale": "Reason.", "guardrail": "Stay safe.", "weight": 5}],
+    }
+    base_path = tmp_path / "base.json"
+    base_path.write_text(json.dumps(base), encoding="utf-8")
+    niche_dir = tmp_path / "niches"
+    niche_dir.mkdir()
+    module = {
+        "schema_version": "klippd.editing_knowledge.module.v1", "module_id": "gaming-extra", "version": "1",
+        "rules": [{"id": "same", "tags": ["gaming"], "rule": "Do another thing.", "rationale": "Reason.", "guardrail": "Stay safe.", "weight": 5}],
+    }
+    (niche_dir / "gaming.json").write_text(json.dumps(module), encoding="utf-8")
+    monkeypatch.setenv("EDITING_KNOWLEDGE_DIR", str(niche_dir))
+    try:
+        load_knowledge(base_path)
+        assert False, "duplicate rule id should fail"
+    except ValueError as exc:
+        assert "Duplicate editing rule id" in str(exc)
+
+
+def test_gaming_synthetic_good_slow_and_overstimulated_cases():
+    case = json.loads(GAMING_FIXTURE.read_text(encoding="utf-8"))
+    good = evaluate_edit_plan(case["good_plan"], case["words"], "gaming")
+    slow = evaluate_edit_plan(case["slow_plan"], case["words"], "gaming")
+    overstimulated = evaluate_edit_plan(case["overstimulated_plan"], case["words"], "gaming")
+
+    assert good["passed"] is True
+    assert good["score"] >= 90
+    assert slow["passed"] is False
+    assert {issue["code"] for issue in slow["issues"]} >= {"gaming_hook_hard_max", "gaming_visual_change_rate_low"}
+    assert overstimulated["passed"] is False
+    assert {issue["code"] for issue in overstimulated["issues"]} >= {"gaming_stylized_transition_rate", "gaming_unmotivated_transition"}
+
+
+def test_minecraft_inherits_gaming_a_grade_and_hard_gates():
+    case = json.loads(GAMING_FIXTURE.read_text(encoding="utf-8"))
+    result = evaluate_edit_plan(case["slow_plan"], case["words"], "minecraft_narrative")
+    assert result["threshold"] == 90
+    assert result["passed"] is False
+    assert any(issue["code"] == "gaming_visual_change_rate_low" for issue in result["issues"])
+
+
+def test_gaming_not_evaluable_fails_admission():
+    words = [{"word": "game"} for _ in range(20)]
+    plan = {"story_beats": [], "transitions": [], "audio_cues": [], "broll_moments": [], "asset_requests": []}
+    result = evaluate_edit_plan(plan, words, "gaming")
+    assert result["passed"] is False
+    assert any(issue["code"] == "gaming_not_evaluable" and issue["severity"] == "critical" for issue in result["issues"])
+
+
+def test_deployment_includes_niche_modules_and_does_not_force_minecraft():
+    dockerignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8")
+    render = (REPO_ROOT / "render.yaml").read_text(encoding="utf-8")
+    server = (REPO_ROOT / "backend" / "server.py").read_text(encoding="utf-8")
+    env_example = (REPO_ROOT / "backend" / ".env.example").read_text(encoding="utf-8")
+    assert "!training/niches/**" in dockerignore
+    assert "EDITING_PROFILE" not in render
+    assert "EDITING_PROFILE" not in server
+    assert "EDITING_PROFILE" not in env_example
 
 
 def test_profile_inference_and_retrieval_select_minecraft_rules():

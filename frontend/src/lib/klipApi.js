@@ -139,13 +139,25 @@ export const uploadVideo = async (file, onProgress) => {
     return project;
 };
 
-export const analyzeProject = (id) =>
-    api.post(`/projects/${id}/analyze`).then((r) => r.data);
+export const analyzeProject = (id, options = {}) =>
+    api.post(`/projects/${id}/analyze`, options).then((r) => r.data);
+export const getTrainingDashboard = () => api.get("/training/dashboard").then((r) => r.data);
+export const createTrainingReference = (body) => api.post("/training/references", body).then((r) => r.data);
+export const createTrainingProfile = (body) => api.post("/training/profiles", body).then((r) => r.data);
+export const activateTrainingProfile = (id) => api.post(`/training/profiles/${id}/activate`).then((r) => r.data);
 export const brollSearch = (pid, query) =>
     api.get(`/projects/${pid}/broll_search`, { params: { query } }).then((r) => r.data);
-export const uploadCustomBroll = (pid, file, onProgress) => {
+export const getAssetPackStatus = (niche) =>
+    api.get("/asset-packs/status", { params: { niche } }).then((r) => r.data);
+export const resolveAssetPack = (niche) =>
+    api.post("/asset-packs/resolve", { niche }, { params: { niche }, timeout: 0 }).then((r) => r.data);
+export const uploadCustomBroll = (pid, file, onProgress, rightsAttested = false) => {
+    if (!rightsAttested) return Promise.reject(new Error("Asset rights confirmation is required"));
     const fd = new FormData();
     fd.append("file", file);
+    fd.append("rights_status", "user_owned_attested");
+    fd.append("rights_attestation", "I own or have commercial rights to this asset");
+    fd.append("license_id", "user-attestation-v1");
     return api
         .post(`/projects/${pid}/broll_upload`, fd, {
             timeout: 0,
@@ -160,6 +172,30 @@ export const extractViralClips = (pid) =>
     api.post(`/projects/${pid}/viral_clips`).then((r) => r.data);
 export const renderProject = (id, opts) =>
     api.post(`/projects/${id}/render`, opts).then((r) => r.data);
+
+// Premium editing surfaces are intentionally kept behind their own API helpers.
+// Deployments that do not expose them yet return 404/501; the components hide
+// themselves without affecting the rest of the editor.
+export const isFeatureUnavailable = (error) =>
+    error?.response?.status === 404 || error?.response?.status === 501;
+
+export const getCreatorProfiles = () =>
+    api.get("/creator-profiles").then((r) => r.data);
+export const createCreatorProfile = (payload) =>
+    api.post("/creator-profiles", payload).then((r) => r.data);
+export const analyzeCreatorProfile = (payload) =>
+    api.post("/creator-profiles/analyze", payload, { timeout: 0 }).then((r) => r.data);
+
+export const getEditChatHistory = (projectId) =>
+    api.get(`/projects/${projectId}/edit-chat/history`).then((r) => r.data);
+export const previewEditChat = (projectId, payload) =>
+    api.post(`/projects/${projectId}/edit-chat/preview`, payload, { timeout: 0 }).then((r) => r.data);
+export const applyEditChatPreview = (projectId, previewId) =>
+    api.post(`/projects/${projectId}/edit-chat/apply`, { preview_id: previewId }, { timeout: 0 }).then((r) => r.data);
+export const undoEditChat = (projectId) =>
+    api.post(`/projects/${projectId}/edit-chat/undo`).then((r) => r.data);
+export const redoEditChat = (projectId) =>
+    api.post(`/projects/${projectId}/edit-chat/redo`).then((r) => r.data);
 
 export const getKeysStatus = () => api.get("/keys/status").then((r) => r.data);
 export const saveKeys = (keys) => api.post("/keys", keys).then((r) => r.data);

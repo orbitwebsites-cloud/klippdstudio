@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom";
-import { Settings, Sparkles, CheckCircle2, XCircle, WifiOff } from "lucide-react";
+import { Settings, Sparkles, CheckCircle2, XCircle, WifiOff, BrainCircuit } from "lucide-react";
 
 export default function TopBar({ keysStatus, backendOnline, onOpenSettings }) {
     const groqOk = keysStatus.groq;
@@ -27,6 +27,9 @@ export default function TopBar({ keysStatus, backendOnline, onOpenSettings }) {
                     </div>
                 </Link>
                 <div className="flex items-center gap-4">
+                    <Link to="/training" className="hidden sm:flex items-center gap-2 text-xs font-mono tracking-wider text-white/60 hover:text-[#ccff00]">
+                        <BrainCircuit className="w-4 h-4" /> TRAINING LAB
+                    </Link>
                     {backendOnline === false && (
                         <div className="hidden sm:flex items-center gap-1.5 text-[#ff5a5a] text-[10px] font-mono tracking-wider">
                             <WifiOff className="w-3.5 h-3.5" /> SERVER OFFLINE
@@ -35,7 +38,6 @@ export default function TopBar({ keysStatus, backendOnline, onOpenSettings }) {
                     <div className="hidden md:flex items-center gap-3 text-xs font-mono">
                         <StatusPill label="GROQ" ok={groqOk} />
                         <StatusPill label="CEREBRAS" ok={keysStatus.cerebras} />
-                        <StatusPill label="PIXABAY" ok={keysStatus.pixabay} />
                     </div>
                     <button
                         onClick={onOpenSettings}

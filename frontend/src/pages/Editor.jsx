@@ -21,6 +21,8 @@ import {
     AlertTriangle,
 } from "lucide-react";
 import LibraryPanel from "@/components/LibraryPanel";
+import CreatorProfilesPanel from "@/components/CreatorProfilesPanel";
+import EditChatPanel from "@/components/EditChatPanel";
 import {
     API,
     getProject,
@@ -75,9 +77,14 @@ export default function Editor() {
     const [renderingClipLabel, setRenderingClipLabel] = useState(null);
     const [currentTime, setCurrentTime] = useState(0);
     const [libraryPick, setLibraryPick] = useState(null);
+    const [creatorProfileId, setCreatorProfileId] = useState(null);
     const videoRef = useRef();
     const transcriptRef = useRef();
     const brollFileInputRef = useRef();
+    const trainingProfileId = useMemo(() => {
+        try { return window.localStorage.getItem("klipped_active_training_profile") || null; }
+        catch { return null; }
+    }, []);
 
     const refresh = useCallback(async () => {
         try { setProject(await getProject(id)); }
@@ -98,10 +105,10 @@ export default function Editor() {
 
     useEffect(() => {
         if (project && project.status === "uploaded") {
-            analyzeProject(id).then(refresh).catch((e) =>
+            analyzeProject(id, { training_profile_id: trainingProfileId }).then(refresh).catch((e) =>
                 toast.error(e?.response?.data?.detail || "Analysis failed to start"));
         }
-    }, [project, id, refresh]);
+    }, [project, id, refresh, trainingProfileId]);
 
     const words = useMemo(() => project?.transcript?.words || [], [project?.transcript?.words]);
     const analysis = project?.analysis || {};
@@ -109,6 +116,7 @@ export default function Editor() {
     const emphasisSet = useMemo(() => new Set(analysis.emphasis_indices || []), [analysis.emphasis_indices]);
     const brollMoments = analysis.broll_moments || [];
     const generatedAssets = analysis.generated_assets || [];
+    const resolvedPackAssets = analysis.resolved_pack_assets || [];
 
     const previewUrl = useCallback((value) => {
         if (!value) return "";
@@ -121,6 +129,31 @@ export default function Editor() {
     useEffect(() => {
         if (project?.viral_clips) setViralClips(project.viral_clips);
     }, [project?.viral_clips]);
+
+    // Chat-applied edits are persisted by the server; mirror them into the
+    // ordinary editor controls so preview, manual tweaks, and render agree.
+    useEffect(() => {
+        const options = project?.chat_render_options;
+        if (!options) return;
+        if (options.style) setStyle(options.style);
+        if (options.aspect) setAspect(options.aspect);
+        setRenderOpts((current) => ({
+            ...current,
+            ...Object.fromEntries(
+                ["remove_fillers", "captions", "sfx", "zoom_ins", "broll"]
+                    .filter((key) => typeof options[key] === "boolean")
+                    .map((key) => [key, options[key]])
+            ),
+        }));
+        if (Array.isArray(options.selected_broll)) {
+            setBrollSelected(Object.fromEntries(
+                options.selected_broll
+                    .filter((item) => Number.isInteger(item?.word_index))
+                    .map((item) => [item.word_index, item])
+            ));
+        }
+        if (project.creator_profile_id) setCreatorProfileId(project.creator_profile_id);
+    }, [project?.chat_render_options, project?.creator_profile_id]);
 
     const effectiveFillers = useMemo(() => {
         const s = new Set(autoFillers);
@@ -180,15 +213,25 @@ export default function Editor() {
 
     const uploadCustomBrollForMoment = async (idx, file) => {
         if (!file) return;
+        const rightsAttested = window.confirm(
+            "Confirm that you own this asset or have commercial rights to use it in exported videos."
+        );
+        if (!rightsAttested) return;
         setUploadingBrollIdx(idx);
         try {
-            const r = await uploadCustomBroll(id, file);
+            const r = await uploadCustomBroll(id, file, undefined, rightsAttested);
+            if (!r?.ok || r?.status === "quarantined") {
+                throw new Error("The asset could not be approved for editing");
+            }
             setCustomBrollByMoment((prev) => ({
                 ...prev,
                 [idx]: [...(prev[idx] || []), r],
             }));
             // Auto-select the uploaded clip
-            setBrollSelected((s) => ({ ...s, [idx]: r }));
+            const wordIndex = brollMoments[idx]?.word_index;
+            if (Number.isInteger(wordIndex)) {
+                setBrollSelected((s) => ({ ...s, [wordIndex]: { ...r, word_index: wordIndex } }));
+            }
             toast.success("Custom B-roll uploaded");
         } catch (e) {
             toast.error(apiErrorMessage(e, "B-roll upload failed"));
@@ -244,13 +287,14 @@ export default function Editor() {
         setRenderStarting(true);
         const selected_broll = Object.entries(brollSelected)
             .filter(([, v]) => v)
-            .map(([idx, v]) => ({
-                word_index: brollMoments[idx]?.word_index || 0,
+            .map(([wordIndex, v]) => ({
+                word_index: Number.isInteger(v.word_index) ? v.word_index : Number(wordIndex),
                 video_url: v.video_url,
                 local_path: v.local_path,
                 is_custom: v.is_custom,
                 generated: v.generated,
-            }));
+            }))
+            .filter((item) => Number.isInteger(item.word_index));
         const opts = {
             style,
             aspect,
@@ -362,6 +406,14 @@ export default function Editor() {
                         )}
                     </div>
 
+                    {isReady && (
+                        <EditChatPanel
+                            projectId={id}
+                            creatorProfileId={creatorProfileId}
+                            onApplied={refresh}
+                        />
+                    )}
+
                     {isReady && words.length > 0 && (
                         <div className="panel">
                             <div className="px-6 py-4 border-b border-white/10 flex items-center justify-between">
@@ -408,6 +460,11 @@ export default function Editor() {
 
                 {isReady && (
                 <aside className="space-y-6" data-testid="editor-sidebar">
+                    <CreatorProfilesPanel
+                        selectedProfileId={creatorProfileId}
+                        onSelectProfile={setCreatorProfileId}
+                    />
+
                     <div className="panel p-6">
                         <div className="font-mono text-xs text-white/40 tracking-widest mb-3">// ASPECT</div>
                         <div className="grid grid-cols-3 gap-2">
@@ -539,8 +596,9 @@ export default function Editor() {
                             const results = brollByMoment[idx] || [];
                             const customs = customBrollByMoment[idx] || [];
                             const generated = generatedAssets.filter((asset) => asset.word_index === m.word_index);
-                            const combined = [...generated, ...customs, ...results];
-                            const selected = brollSelected[idx];
+                            const matchedPack = resolvedPackAssets.filter((asset) => asset.word_index === m.word_index);
+                            const combined = [...matchedPack, ...generated, ...customs, ...results];
+                            const selected = brollSelected[m.word_index];
                             const isUploading = uploadingBrollIdx === idx;
                             return (
                                 <div key={idx} className="panel p-5" data-testid={`broll-moment-${idx}`}>
@@ -563,7 +621,7 @@ export default function Editor() {
                                             ) : (
                                                 <Search className="w-3 h-3" />
                                             )}
-                                            {results.length ? "Refresh" : "Pixabay"}
+                                            {results.length ? "Refresh Pack" : "Approved Pack"}
                                         </button>
                                         <label
                                             className="btn-ghost !text-xs !py-1.5 cursor-pointer"
@@ -603,7 +661,7 @@ export default function Editor() {
                                                         onClick={() =>
                                                             setBrollSelected((s) => ({
                                                                 ...s,
-                                                                [idx]: active ? undefined : r,
+                                                                [m.word_index]: active ? undefined : { ...r, word_index: m.word_index },
                                                             }))
                                                         }
                                                         data-testid={`broll-clip-${idx}-${r.id}`}
@@ -650,12 +708,14 @@ export default function Editor() {
             {isReady && (
                 <LibraryPanel
                     activeSelection={libraryPick}
+                    niche={analysis?.quality_review?.profile || analysis?.profile || "gaming"}
                     onPickAsset={(asset) => {
                         // If B-roll moments exist, assign to the first unassigned one
                         if (brollMoments.length > 0) {
-                            const firstFree = brollMoments.findIndex((_, i) => !brollSelected[i]);
+                            const firstFree = brollMoments.findIndex((moment) => !brollSelected[moment.word_index]);
                             const idx = firstFree === -1 ? 0 : firstFree;
-                            setBrollSelected((s) => ({ ...s, [idx]: asset }));
+                            const wordIndex = brollMoments[idx].word_index;
+                            setBrollSelected((s) => ({ ...s, [wordIndex]: { ...asset, word_index: wordIndex } }));
                             setLibraryPick(asset);
                             toast.success(`Assigned to moment #${idx + 1}${firstFree === -1 ? " (replaced)" : ""}`);
                         } else {

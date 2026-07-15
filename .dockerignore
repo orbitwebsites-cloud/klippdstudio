@@ -3,5 +3,9 @@
 !backend/**
 !training/
 !training/editing_knowledge_v1.json
+!training/niches/
+!training/niches/**
+!training/assets/
+!training/assets/**
 backend/__pycache__/
 backend/tests/

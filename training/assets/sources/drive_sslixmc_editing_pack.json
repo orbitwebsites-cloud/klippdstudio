@@ -1,0 +1,12 @@
+{
+  "schema_version": "klippd.asset_source_decision.v1",
+  "source_id": "drive_sslixmc_editing_pack",
+  "status": "quarantine_reference_only",
+  "decision_basis": "SSLIXMC EDITING PACK NOTE.txt states the uploader does not own the assets and supplies no licenses.",
+  "rights_status": "unknown_and_disclaimed",
+  "allowed_actions": ["metadata_inventory", "request_rights_proof"],
+  "denied_actions": ["download", "preview", "embedding", "training", "render", "redistribution"],
+  "bytes_are_training_data": false,
+  "creator_pack_use_allowed": false,
+  "remediation": "Obtain per-asset rights proof from the actual rightsholder or replace with approved sources."
+}

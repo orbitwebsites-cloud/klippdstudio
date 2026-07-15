@@ -1,0 +1,85 @@
+{
+  "schema_version": "klippd.niche_research.v1",
+  "research_id": "gaming-priors-v1",
+  "niche": "gaming",
+  "status": "evidence_labeled_prior",
+  "evidence_notice": "These values are editorial priors supplied for system initialization, not measurements of named creators or downloaded public videos.",
+  "replacement_requirement": "Replace or recalibrate numerical priors only after annotation of user-owned or properly licensed footage, retaining sample size, distribution, and provenance.",
+  "confidence_scale": {"low": "directional only", "medium": "usable as a bounded starting range", "high": "reserved for validated owned/licensed annotations"},
+  "provenance": {
+    "public_footage_downloaded": false,
+    "model_fine_tuning_claimed": false,
+    "creator_identity_cloning": false,
+    "allowed_uses": ["retrieval rules", "synthetic evaluation fixtures", "future owned/licensed annotation calibration"]
+  },
+  "priors": {
+    "hook": {
+      "ideal_window_s": [0, 8],
+      "supported_stake_target_s": 3,
+      "hard_max_s": 12,
+      "confidence": "medium"
+    },
+    "meaningful_visual_changes_per_min": {
+      "hook": [20, 36],
+      "setup": [10, 18],
+      "combat_highlight": [24, 48],
+      "connective_narration": [12, 24],
+      "payoff": [8, 16],
+      "whole_video": [14, 26],
+      "definition": "A motivated change in shot, crop, proof overlay, readable graphic, or game-state presentation; decorative flicker does not count.",
+      "confidence": "low"
+    },
+    "median_shot_duration_s": {
+      "hook": [1.2, 2.5],
+      "combat": [0.5, 1.5],
+      "narration_proof": [2.0, 4.5],
+      "payoff_hold": [2.0, 5.0],
+      "confidence": "low"
+    },
+    "narrative_state": {
+      "micro_state_changes_per_min": [3, 6],
+      "major_peaks_per_min": [0.7, 1.5],
+      "max_unresolved_span_s": 35,
+      "confidence": "low"
+    },
+    "stylized_transitions": {
+      "per_min": [0, 2],
+      "duration_frames_at_60fps": [4, 10],
+      "allowed_condition": "Matched directional motion or a real action/state transition.",
+      "confidence": "medium"
+    },
+    "captions": {
+      "phrase_words": [2, 7],
+      "max_highlighted_words": 2,
+      "minimum_visible_s": 0.7,
+      "hud_safe": true,
+      "confidence": "medium"
+    },
+    "proof": {
+      "concrete_claim_coverage_ratio": [0.75, 1.0],
+      "allowed_sources": ["user-owned gameplay", "licensed gameplay", "honest non-evidence editorial graphic"],
+      "confidence": "low"
+    },
+    "audio": {
+      "voice_lufs_integrated": [-16, -14],
+      "true_peak_max_dbfs": -1,
+      "music_ducking_db": [8, 14],
+      "dialogue_edit_fade_ms": [20, 80],
+      "confidence": "medium",
+      "measurement_required": true
+    }
+  },
+  "admission_policy": {
+    "minimum_grade": "A",
+    "minimum_score": 90,
+    "not_evaluable_result": "fail",
+    "hard_gates": [
+      "transcript or timeline timing must be measurable",
+      "supported hook must start no later than 12 seconds",
+      "no unsupported or fabricated gameplay, UI, result, logo, quote, or evidence",
+      "stylized transitions must be motivated by matched direction or a real action/state change",
+      "dialogue must remain intelligible",
+      "critical HUD and action must remain readable"
+    ]
+  }
+}

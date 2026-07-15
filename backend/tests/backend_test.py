@@ -42,7 +42,7 @@ class TestRootAndKeys:
         r = requests.get(f"{API}/keys/status", timeout=10)
         assert r.status_code == 200
         j = r.json()
-        assert j == {"groq": True, "cerebras": True, "pixabay": True}
+        assert j == {"groq": True, "cerebras": True}
 
     def test_keys_test(self):
         r = requests.post(f"{API}/keys/test", timeout=60)
@@ -52,23 +52,11 @@ class TestRootAndKeys:
         assert "model" in j["groq"]
         assert j["cerebras"]["ok"] is True, j["cerebras"]
         assert "model" in j["cerebras"]
-        assert j["pixabay"]["ok"] is True, j["pixabay"]
 
     def test_keys_update_no_downgrade(self):
         # Post empty dict-ish - should 400
         r = requests.post(f"{API}/keys", json={}, timeout=10)
         assert r.status_code == 400
-        # Post a dummy update to Pixabay; status should remain configured.
-        r2 = requests.post(f"{API}/keys", json={"pixabay": "dummy_ignored_val_xyz"}, timeout=10)
-        assert r2.status_code == 200
-        assert "pixabay" in r2.json()["updated"]
-        # Status still returns true
-        r3 = requests.get(f"{API}/keys/status", timeout=10)
-        assert r3.json()["pixabay"] is True
-        # Restore real key
-        real = os.environ.get("SEED_PIXABAY_KEY")
-        if real:
-            requests.post(f"{API}/keys", json={"pixabay": real}, timeout=10)
 
 
 # ---------- Projects CRUD ----------

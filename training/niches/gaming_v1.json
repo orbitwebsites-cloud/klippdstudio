@@ -1,0 +1,91 @@
+{
+  "schema_version": "klippd.editing_knowledge.module.v1",
+  "module_id": "gaming",
+  "version": "1.0.0-prior",
+  "description": "Gaming editing rules synthesized from low-to-medium-confidence editorial priors. Numerical targets require recalibration with user-owned or licensed annotations.",
+  "evidence_status": "priors_not_creator_measurements",
+  "research_source": "training/research/gaming/research_v1.json",
+  "validation_policy": {"minimum_score": 90, "not_evaluable": "fail", "hard_gates_required": true},
+  "rules": [
+    {
+      "id": "gaming-hook-supported-stake",
+      "tags": ["gaming", "story", "hook", "qa"],
+      "rule": "Open on a transcript- and footage-supported stake within 0 to 8 seconds, target clarity by 3 seconds, and reject openings later than 12 seconds.",
+      "rationale": "A fast, honest question or consequence gives action immediate meaning.",
+      "guardrail": "Do not invent danger, outcomes, opponents, rewards, or reactions to manufacture a hook; numerical timing is a medium-confidence prior pending owned-footage calibration.",
+      "weight": 10
+    },
+    {
+      "id": "gaming-visual-change-by-phase",
+      "tags": ["gaming", "pacing", "continuity", "qa"],
+      "rule": "Vary motivated visual-change density by phase: fastest during hooks and combat, moderate during setup and proof-backed narration, and slower for a readable payoff hold.",
+      "rationale": "Phase-aware contrast preserves energy without making every moment equally noisy.",
+      "guardrail": "Do not cut to satisfy a timer; the supplied numerical ranges are low-confidence priors and must be replaced after owned or licensed annotation.",
+      "weight": 10
+    },
+    {
+      "id": "gaming-state-change-synchronization",
+      "tags": ["gaming", "story", "pacing", "continuity"],
+      "rule": "Synchronize cuts, crops, proof overlays, and impacts to real changes in objective, threat, location, player, resource, health, action, setback, or result.",
+      "rationale": "State-synchronized intensity makes fast edits legible and causally meaningful.",
+      "guardrail": "Decorative flicker, random zooms, and repeated cuts with no new information do not count as meaningful changes.",
+      "weight": 10
+    },
+    {
+      "id": "gaming-open-loop-refresh",
+      "tags": ["gaming", "story", "qa", "pacing"],
+      "rule": "Within any 35-second span, resolve or refresh the viewer's question through a supported state change, consequence, escalation, or payoff.",
+      "rationale": "Long stretches without new information weaken forward momentum.",
+      "guardrail": "Do not fabricate a twist or interrupt necessary explanation solely to hit the low-confidence prior.",
+      "weight": 9
+    },
+    {
+      "id": "gaming-highlight-action-readability",
+      "tags": ["gaming", "continuity", "pacing", "qa"],
+      "rule": "For highlights and combat, preserve anticipation, decisive action, outcome proof, and a readable reaction or payoff frame even when surrounding shots are short.",
+      "rationale": "A highlight only lands when the viewer can perceive what happened and why it mattered.",
+      "guardrail": "Never hide the decisive frame under motion blur, captions, zooms, or another transition.",
+      "weight": 10
+    },
+    {
+      "id": "gaming-motion-transition-match",
+      "tags": ["gaming", "transitions", "continuity", "qa"],
+      "rule": "Use a brief motion-blur, whip, or push transition only when incoming and outgoing motion share direction or when a real action/state change motivates it.",
+      "rationale": "Directional matching can preserve momentum across a high-intensity discontinuity.",
+      "guardrail": "Prefer a hard cut otherwise; cap stylized transitions near 0 to 2 per minute and treat 4 to 10 frames at 60 fps as a medium-confidence prior, not a mandate.",
+      "weight": 9
+    },
+    {
+      "id": "gaming-caption-hud-safe-phrases",
+      "tags": ["gaming", "captions", "continuity", "qa"],
+      "rule": "Use meaning-complete caption phrases of roughly 2 to 7 words, highlight no more than two consequential words, keep them visible at least 0.7 seconds, and reposition around the HUD and decisive action.",
+      "rationale": "Readable phrases reinforce stakes without competing with gameplay information.",
+      "guardrail": "Do not cover health, inventory, crosshair, minimap, objectives, subtitles, chat, or the decisive action; timing values are medium-confidence priors.",
+      "weight": 9
+    },
+    {
+      "id": "gaming-proof-concrete-claims",
+      "tags": ["gaming", "broll", "evidence", "qa"],
+      "rule": "Support concrete claims with exact user-owned or licensed gameplay proof whenever available, aiming to cover most verifiable claims before adding decorative visuals.",
+      "rationale": "Claim-to-proof alignment improves comprehension and trust in fast narratives.",
+      "guardrail": "The 0.75 to 1.0 coverage target is a low-confidence prior; never fill a gap with fake gameplay, UI, results, logos, quotes, or evidence.",
+      "weight": 10
+    },
+    {
+      "id": "gaming-audio-dialogue-master",
+      "tags": ["gaming", "audio", "qa"],
+      "rule": "Mix around dialogue intelligibility first: use -16 to -14 LUFS integrated voice as a starting range, keep peaks at or below -1 dBFS, duck music about 8 to 14 dB, and smooth dialogue edits with 20 to 80 ms fades.",
+      "rationale": "Clear speech anchors complex action and survives mobile playback.",
+      "guardrail": "These medium-confidence priors require loudness measurement and owned-footage validation; never boost noise, clip speech, or let impacts mask words.",
+      "weight": 10
+    },
+    {
+      "id": "gaming-validation-a-grade",
+      "tags": ["gaming", "qa"],
+      "rule": "Admit a Gaming plan only at score 90 or higher with every hard gate passed; treat missing timing or required evidence as NOT_EVALUABLE and fail it for review.",
+      "rationale": "Strict admission prevents unknown quality from being mislabeled as a successful high-intensity edit.",
+      "guardrail": "Do not convert missing measurements into invented values or lower the gate to force acceptance.",
+      "weight": 10
+    }
+  ]
+}

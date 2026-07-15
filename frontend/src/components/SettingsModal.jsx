@@ -20,19 +20,11 @@ const PROVIDERS = [
         placeholder: "csk-...",
         required: false,
     },
-    {
-        id: "pixabay",
-        name: "Pixabay",
-        role: "B-roll Stock (recommended)",
-        url: "https://pixabay.com/api/docs/",
-        placeholder: "12345678-abc...",
-        required: false,
-    },
 ];
 
 export default function SettingsModal({ open, onClose, onSaved }) {
-    const [values, setValues] = useState({ groq: "", cerebras: "", pixabay: "" });
-    const [status, setStatus] = useState({ groq: false, cerebras: false, pixabay: false });
+    const [values, setValues] = useState({ groq: "", cerebras: "" });
+    const [status, setStatus] = useState({ groq: false, cerebras: false });
     const [testResults, setTestResults] = useState(null);
     const [testing, setTesting] = useState(false);
     const [saving, setSaving] = useState(false);
@@ -42,7 +34,7 @@ export default function SettingsModal({ open, onClose, onSaved }) {
             getKeysStatus().then(setStatus).catch((error) => {
                 toast.error(apiErrorMessage(error, "Could not load key status"));
             });
-            setValues({ groq: "", cerebras: "", pixabay: "" });
+            setValues({ groq: "", cerebras: "" });
             setTestResults(null);
         }
     }, [open]);
@@ -66,7 +58,7 @@ export default function SettingsModal({ open, onClose, onSaved }) {
             setStatus(fresh);
             onSaved?.();
             toast.success("Keys locked in");
-            setValues({ groq: "", cerebras: "", pixabay: "" });
+            setValues({ groq: "", cerebras: "" });
         } catch (e) {
             toast.error(apiErrorMessage(e, "Save failed"));
         } finally {
@@ -123,7 +115,7 @@ export default function SettingsModal({ open, onClose, onSaved }) {
                     </div>
                     <p className="text-white/60 text-sm">
                         Paste your free-tier keys — we encrypt them before storing.
-                        Groq is required, Cerebras is fallback, and Pixabay enables stock B-roll.
+                        Groq is required and Cerebras provides the fallback model.
                     </p>
                 </div>
 

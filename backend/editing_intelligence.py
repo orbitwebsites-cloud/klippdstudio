@@ -23,20 +23,87 @@ DEFAULT_KNOWLEDGE_PATH = Path(
     )
 )
 QUALITY_THRESHOLD = 82
+GAMING_QUALITY_THRESHOLD = 90
 _UNSAFE_GENERATION_TERMS = re.compile(
     r"\b(fake|fabricat(?:e|ed)|screenshot|gameplay footage|photo of|logo|official ui|proof of|evidence of)\b",
     re.IGNORECASE,
 )
 
 
+def _validate_knowledge_pack(data: Dict[str, Any], source: Path, *, module: bool = False) -> None:
+    expected = "klippd.editing_knowledge.module.v1" if module else "klippd.editing_knowledge.v1"
+    if data.get("schema_version") != expected:
+        raise ValueError(f"Unsupported editing knowledge schema in {source}: {data.get('schema_version')!r}")
+    if not isinstance(data.get("rules"), list) or not data["rules"]:
+        raise ValueError(f"Editing knowledge contains no rules: {source}")
+    seen = set()
+    for rule in data["rules"]:
+        if not isinstance(rule, dict):
+            raise ValueError(f"Editing rule must be an object: {source}")
+        rule_id = rule.get("id")
+        if not isinstance(rule_id, str) or not rule_id.strip() or rule_id in seen:
+            raise ValueError(f"Invalid or duplicate editing rule id {rule_id!r}: {source}")
+        seen.add(rule_id)
+        if not isinstance(rule.get("tags"), list) or not all(isinstance(tag, str) and tag for tag in rule["tags"]):
+            raise ValueError(f"Editing rule {rule_id!r} has invalid tags: {source}")
+        if not isinstance(rule.get("rule"), str) or not rule["rule"].strip():
+            raise ValueError(f"Editing rule {rule_id!r} has no actionable rule: {source}")
+        if not isinstance(rule.get("rationale"), str) or not rule["rationale"].strip():
+            raise ValueError(f"Editing rule {rule_id!r} has no rationale: {source}")
+        if not isinstance(rule.get("guardrail"), str) or not rule["guardrail"].strip():
+            raise ValueError(f"Editing rule {rule_id!r} has no guardrail: {source}")
+        weight = rule.get("weight")
+        if not isinstance(weight, int) or isinstance(weight, bool) or not 1 <= weight <= 10:
+            raise ValueError(f"Editing rule {rule_id!r} has weight outside 1..10: {source}")
+
+
 def load_knowledge(path: str | Path | None = None) -> Dict[str, Any]:
     knowledge_path = Path(path) if path else DEFAULT_KNOWLEDGE_PATH
     with knowledge_path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
-    if data.get("schema_version") != "klippd.editing_knowledge.v1":
-        raise ValueError(f"Unsupported editing knowledge schema: {data.get('schema_version')!r}")
-    if not isinstance(data.get("rules"), list) or not data["rules"]:
-        raise ValueError("Editing knowledge contains no rules")
+    _validate_knowledge_pack(data, knowledge_path)
+
+    base_id = str(data.get("knowledge_id", knowledge_path.stem))
+    base_version = str(data.get("version", "1"))
+    modules = [{"id": base_id, "version": base_version, "schema_version": data["schema_version"]}]
+    for rule in data["rules"]:
+        rule["_module_id"] = base_id
+
+    module_dir = Path(os.environ.get("EDITING_KNOWLEDGE_DIR", str(knowledge_path.parent / "niches")))
+    known_rule_ids = {rule["id"] for rule in data["rules"]}
+    known_profiles = set(data.get("profiles", {}))
+    if module_dir.is_dir():
+        for module_path in sorted(module_dir.glob("*.json"), key=lambda item: item.name.lower()):
+            with module_path.open("r", encoding="utf-8") as handle:
+                module_data = json.load(handle)
+            _validate_knowledge_pack(module_data, module_path, module=True)
+            module_id = module_data.get("module_id")
+            module_version = module_data.get("version")
+            if not isinstance(module_id, str) or not module_id.strip() or not isinstance(module_version, str) or not module_version.strip():
+                raise ValueError(f"Knowledge module needs stable module_id and version: {module_path}")
+            if any(item["id"] == module_id for item in modules):
+                raise ValueError(f"Duplicate knowledge module id {module_id!r}: {module_path}")
+            module_profiles = module_data.get("profiles", {})
+            if not isinstance(module_profiles, dict):
+                raise ValueError(f"Knowledge module profiles must be an object: {module_path}")
+            conflicts = known_profiles & set(module_profiles)
+            if conflicts:
+                raise ValueError(f"Knowledge module profile conflicts {sorted(conflicts)}: {module_path}")
+            for rule in module_data["rules"]:
+                if rule["id"] in known_rule_ids:
+                    raise ValueError(f"Duplicate editing rule id {rule['id']!r}: {module_path}")
+                rule["_module_id"] = module_id
+                known_rule_ids.add(rule["id"])
+                data["rules"].append(rule)
+            data.setdefault("profiles", {}).update(module_profiles)
+            known_profiles.update(module_profiles)
+            modules.append({
+                "id": module_id,
+                "version": module_version,
+                "schema_version": module_data["schema_version"],
+                "evidence_status": str(module_data.get("evidence_status", "unspecified")),
+            })
+    data["_knowledge_modules"] = modules
     return data
 
 
@@ -89,8 +156,12 @@ def retrieve_editing_context(
             query_tags.add(tag)
 
     ranked = []
+    profile_names = set(knowledge.get("profiles", {})) - {"general"}
     for rule in knowledge.get("rules", []):
         tags = {str(tag) for tag in rule.get("tags", [])}
+        niche_tags = tags & profile_names
+        if niche_tags and profile not in niche_tags:
+            continue
         relevance = len(tags & query_tags)
         if not relevance:
             continue
@@ -99,6 +170,9 @@ def retrieve_editing_context(
         ranked.append((score, str(rule.get("id", "")), rule))
     ranked.sort(key=lambda item: (-item[0], item[1]))
     selected = [copy.deepcopy(item[2]) for item in ranked[:max(1, max_rules)]]
+    selected_module_ids = {str(rule.get("_module_id", "")) for rule in selected}
+    for rule in selected:
+        rule.pop("_module_id", None)
     profile_config = copy.deepcopy(knowledge.get("profiles", {}).get(profile, {}))
     return {
         "schema_version": "klippd.retrieval_context.v1",
@@ -108,6 +182,10 @@ def retrieve_editing_context(
         "rules": selected,
         "rule_ids": [rule.get("id") for rule in selected],
         "provenance_policy": copy.deepcopy(knowledge.get("provenance_policy", {})),
+        "knowledge_modules": [
+            copy.deepcopy(module) for module in knowledge.get("_knowledge_modules", [])
+            if module.get("id") in selected_module_ids
+        ],
     }
 
 
@@ -224,13 +302,88 @@ def evaluate_edit_plan(
     if len(plan.get("transitions", [])) > max(5, word_count // 45 + 2):
         issue("transition_density", "warning", "Stylized transition planning is too dense.", 7)
 
+    if profile in {"gaming", "minecraft_narrative"}:
+        timed_words = [
+            word for word in words
+            if isinstance(word, dict)
+            and isinstance(word.get("start"), (int, float))
+            and isinstance(word.get("end"), (int, float))
+        ]
+        duration = (
+            float(timed_words[-1]["end"]) - float(timed_words[0]["start"])
+            if len(timed_words) == word_count and timed_words else 0.0
+        )
+        if duration <= 0:
+            issue("gaming_not_evaluable", "critical", "Gaming admission requires measurable transcript or timeline timing.", 30)
+        else:
+            def event_time(index: int) -> float:
+                return float(words[index].get("start", 0.0)) - float(words[0].get("start", 0.0))
+
+            hook_events = [
+                event for event in beats
+                if isinstance(event, dict)
+                and event.get("beat_type") == "hook"
+                and _valid_index(event.get("word_index"), word_count)
+            ]
+            if hook_events:
+                hook_time = min(event_time(event["word_index"]) for event in hook_events)
+                hook_has_stake = any(len(str(event.get("intent", "")).strip()) >= 8 for event in hook_events)
+                if hook_time > 12:
+                    issue("gaming_hook_hard_max", "critical", "The supported Gaming hook starts after the 12-second hard maximum.", 20)
+                elif hook_time > 8:
+                    issue("gaming_hook_late", "warning", "The Gaming hook starts outside the 0-to-8-second ideal window.", 7)
+                elif hook_time > 3 or not hook_has_stake:
+                    issue("gaming_stake_clarity", "warning", "The opening does not establish a supported stake by the 3-second target.", 5)
+
+            meaningful_indices = set(emphasis)
+            for key in ("story_beats", "broll_moments", "transitions"):
+                meaningful_indices.update(_event_indices(plan, key, word_count))
+            visual_change_rate = len(meaningful_indices) * 60.0 / duration
+            if visual_change_rate < 10:
+                issue("gaming_visual_change_rate_low", "critical", "The Gaming plan is too sluggish to admit; motivated visual changes are below the setup floor.", 18)
+            elif visual_change_rate < 14:
+                issue("gaming_visual_change_rate_low", "warning", "The whole-video motivated visual-change rate is below the 14-per-minute prior.", 7)
+
+            state_times = sorted({
+                event_time(event["word_index"])
+                for event in beats
+                if isinstance(event, dict) and _valid_index(event.get("word_index"), word_count)
+            })
+            state_boundaries = [0.0, *state_times, duration]
+            if any(right - left > 35 for left, right in zip(state_boundaries, state_boundaries[1:])):
+                issue("gaming_unresolved_span", "critical", "More than 35 seconds pass without a supported question, state change, or payoff.", 14)
+
+            stylized = [
+                event for event in plan.get("transitions", [])
+                if isinstance(event, dict) and event.get("type") != "hard_cut"
+            ]
+            stylized_rate = len(stylized) * 60.0 / duration
+            if duration >= 30 and stylized_rate > 2:
+                issue("gaming_stylized_transition_rate", "critical", "Stylized transitions exceed the 0-to-2-per-minute Gaming prior.", 14)
+            unmotivated = sum(
+                1 for event in stylized
+                if not re.search(r"\b(match|direction|motion|action|state|impact|location|movement)\w*\b", str(event.get("reason", "")), re.IGNORECASE)
+            )
+            if unmotivated:
+                issue("gaming_unmotivated_transition", "critical", f"{unmotivated} stylized transitions lack matched motion or a real action/state reason.", min(16, unmotivated * 6))
+
+            proof_beats = [
+                event for event in beats
+                if isinstance(event, dict) and event.get("beat_type") in {"escalation", "setback", "reveal", "payoff"}
+            ]
+            if proof_beats:
+                proof_coverage = min(1.0, len(broll) / len(proof_beats))
+                if proof_coverage < 0.75:
+                    issue("gaming_proof_coverage", "warning", "Fewer than 75% of concrete escalation/payoff beats have a visual-proof intent.", 7)
+
     score = max(0, min(100, score))
     critical = sum(1 for item in issues if item["severity"] == "critical")
+    threshold = GAMING_QUALITY_THRESHOLD if profile in {"gaming", "minecraft_narrative"} else QUALITY_THRESHOLD
     return {
         "schema_version": "klippd.plan_evaluation.v1",
         "score": score,
-        "passed": score >= QUALITY_THRESHOLD and critical == 0,
-        "threshold": QUALITY_THRESHOLD,
+        "passed": score >= threshold and critical == 0,
+        "threshold": threshold,
         "profile": profile,
         "critical_count": critical,
         "issues": issues,
@@ -323,6 +476,7 @@ def quality_gate_edit_plan(
         "threshold": final["threshold"],
         "profile": context["profile"],
         "knowledge_rule_ids": context["rule_ids"],
+        "knowledge_modules": context.get("knowledge_modules", []),
         "rounds": reviews,
         "remaining_issues": final["issues"],
         "note": "Deterministic grounding and restraint gate; no copyrighted-footage fine-tuning is implied.",

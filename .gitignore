@@ -93,6 +93,7 @@ data/videos/9184b36b-7bed-49cc-b41f-9164110b7bb6.mov
 # Runtime/editor data. Keep downloaded packs, generated graphics, resumable
 # chunks, local secrets and user uploads out of deploys and commits.
 data/reference-assets/
+data/quarantine/
 data/library/
 data/uploads_tmp/
 data/broll/

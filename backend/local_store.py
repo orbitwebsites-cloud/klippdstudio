@@ -107,6 +107,8 @@ class LocalDatabase:
             self.data = {}
         self.projects = LocalCollection(self, "projects")
         self.settings = LocalCollection(self, "settings")
+        self.training_references = LocalCollection(self, "training_references")
+        self.training_profiles = LocalCollection(self, "training_profiles")
 
     def _flush(self):
         temp = self.path.with_suffix(".tmp")

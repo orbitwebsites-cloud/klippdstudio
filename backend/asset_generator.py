@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
+import hashlib
+import os
 import re
 import uuid
 
@@ -15,6 +17,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 WIDTH, HEIGHT = 1920, 1080
+GENERATOR_ID = "klipped_editorial_graphics"
+GENERATOR_VERSION = "1.0.0"
 KINDS = {"title_card", "stat_card", "player_label", "item_callout", "quote_card"}
 ACCENTS = {
     "gold": "#E7B84B",
@@ -112,7 +116,7 @@ def _render(spec: Dict[str, Any], destination: Path) -> None:
 
 
 def generate_assets(requests: Iterable[Dict[str, Any]], project_id: str,
-                    library_dir: Path) -> List[Dict[str, Any]]:
+                    library_dir: Path, niche: str = "general") -> List[Dict[str, Any]]:
     """Generate up to five requested graphics and return editor asset objects."""
     library_dir.mkdir(parents=True, exist_ok=True)
     output: List[Dict[str, Any]] = []
@@ -134,7 +138,13 @@ def generate_assets(requests: Iterable[Dict[str, Any]], project_id: str,
             word_index = 0
         filename = f"generated_{project_id[:8]}_{uuid.uuid4().hex[:8]}.png"
         destination = library_dir / filename
-        _render(spec, destination)
+        temporary = library_dir / f".{filename}.{uuid.uuid4().hex}.generating"
+        try:
+            _render(spec, temporary)
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        digest = hashlib.sha256(destination.read_bytes()).hexdigest()
         output.append({
             "id": f"gen_{destination.stem}",
             "name": filename,
@@ -146,6 +156,16 @@ def generate_assets(requests: Iterable[Dict[str, Any]], project_id: str,
             "is_custom": True,
             "generated": True,
             "provider": "klipped_generator",
+            "source_id": "klipped_generator",
+            "sha256": digest,
+            "mime_type": "image/png",
+            "rights_status": "generated_editorial",
+            "license_id": "in-house-generated",
+            "provenance": "generated_editorial_graphic",
+            "is_evidence": False,
+            "generator": GENERATOR_ID,
+            "generator_version": GENERATOR_VERSION,
+            "niche": niche,
             "word_index": word_index,
             "asset_kind": kind,
             "reason": _clean(raw.get("reason"), 180),

@@ -1,8 +1,4 @@
-"""AI service integrations with fallback logic.
-- Groq (primary) + Cerebras (fallback) for text tasks
-- Groq Whisper for transcription
-- Pixabay for stock B-roll search
-"""
+"""AI service integrations for transcription and edit planning."""
 import json
 import logging
 import re
@@ -220,7 +216,10 @@ def _quality_rank(plan: Dict[str, Any]) -> tuple[int, int, int]:
     return (int(bool(review.get("passed"))), -critical, int(review.get("score", 0)))
 
 
-async def analyze_transcript(words: List[Dict], keys: dict, profile: str | None = None) -> Dict[str, Any]:
+async def analyze_transcript(
+    words: List[Dict], keys: dict, profile: str | None = None,
+    training_context: str = "",
+) -> Dict[str, Any]:
     """Build a complete, transcript-grounded editing blueprint."""
     max_words = min(len(words), 1200)
     lines = []
@@ -281,6 +280,11 @@ Rules:
 - Never fabricate gameplay, results, screenshots, people, quotes or evidence.
 - Return ONLY the JSON. No markdown. No commentary.
 {profile_rules}
+
+USER-APPROVED EDITING PROFILE:
+{training_context[:5000] if training_context else "None selected. Use only the retrieved editing knowledge above."}
+
+Treat this profile as general editorial guidance, not a request to imitate a creator or reproduce a reference sequence. Apply it only when supported by this video's transcript and footage.
 {knowledge_rules}
 """
     raw = await call_text_llm(prompt, keys, system=system, want_json=True)
@@ -347,56 +351,6 @@ Rules:
         "final_score": int(selected_review.get("score", 0)),
     })
     return selected
-
-
-# ---------- PIXABAY (higher-quality free alternative) ----------
-async def search_pixabay_video(query: str, pixabay_key: str, per_page: int = 6,
-                               orientation: str = "horizontal") -> List[Dict]:
-    """Search Pixabay for stock video clips. Free, no attribution required."""
-    if not pixabay_key:
-        return []
-    url = "https://pixabay.com/api/videos/"
-    # Pixabay video_type: film/animation; orientation: horizontal/vertical/all
-    orient = "vertical" if orientation in ("portrait", "vertical") else "horizontal"
-    params = {
-        "key": pixabay_key,
-        "q": query,
-        "per_page": max(3, min(per_page, 20)),
-        "video_type": "film",
-        "orientation": orient,
-        "safesearch": "true",
-    }
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(url, params=params)
-        if r.status_code != 200:
-            logger.warning(f"Pixabay error {r.status_code}: {r.text[:200]}")
-            return []
-        data = r.json()
-    results = []
-    for v in data.get("hits", []):
-        vids = v.get("videos", {})
-        # Prefer large/medium quality
-        picked = None
-        for key in ("large", "medium", "small"):
-            f = vids.get(key) or {}
-            if f.get("url") and f.get("width", 0) >= 640:
-                picked = f
-                picked["_tier"] = key
-                break
-        if not picked:
-            continue
-        results.append({
-            "id": f"pb_{v.get('id')}",
-            "provider": "pixabay",
-            "duration": v.get("duration"),
-            "thumbnail": (vids.get("large") or vids.get("medium") or {}).get("thumbnail")
-                         or f"https://i.vimeocdn.com/video/{v.get('picture_id')}_640x360.jpg",
-            "video_url": picked.get("url"),
-            "width": picked.get("width"),
-            "height": picked.get("height"),
-            "user": v.get("user", ""),
-        })
-    return results
 
 
 # ---------- VIRAL CLIP EXTRACTION ----------
@@ -493,8 +447,6 @@ async def test_groq(api_key: str) -> Dict[str, Any]:
         return {"ok": True, "model": r.model}
     except Exception as e:
         return {"ok": False, "error": str(e)[:200]}
-
-
 async def test_cerebras(api_key: str) -> Dict[str, Any]:
     if not api_key:
         return {"ok": False, "error": "No key"}
@@ -508,19 +460,4 @@ async def test_cerebras(api_key: str) -> Dict[str, Any]:
         return {"ok": True, "model": r.model}
     except Exception as e:
         return {"ok": False, "error": str(e)[:200]}
-
-
-async def test_pixabay(api_key: str) -> Dict[str, Any]:
-    if not api_key:
-        return {"ok": False, "error": "No key"}
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(
-                "https://pixabay.com/api/videos/",
-                params={"key": api_key, "q": "city", "per_page": 3},
-            )
-        if r.status_code == 200:
-            return {"ok": True}
-        return {"ok": False, "error": f"HTTP {r.status_code}"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:200]}
+# End of provider connection checks.

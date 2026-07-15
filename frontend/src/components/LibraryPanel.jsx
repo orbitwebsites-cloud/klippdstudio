@@ -1,19 +1,21 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Upload, Loader2, Trash2, Image as ImageIcon, Film, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import { API, apiErrorMessage } from "@/lib/klipApi";
 import axios from "axios";
+import AssetPackStatus from "@/components/AssetPackStatus";
 
 const api = axios.create({ baseURL: API });
 
-export default function LibraryPanel({ onPickAsset, activeSelection }) {
+export default function LibraryPanel({ onPickAsset, activeSelection, niche = "gaming" }) {
     const [items, setItems] = useState([]);
     const [uploading, setUploading] = useState(false);
+    const [rightsConfirmed, setRightsConfirmed] = useState(false);
     const [loading, setLoading] = useState(true);
     const [loadError, setLoadError] = useState(false);
     const inputRef = useRef();
 
-    const refresh = async () => {
+    const refresh = useCallback(async () => {
         try {
             const { data } = await api.get("/library");
             setItems(data.items || []);
@@ -22,22 +24,32 @@ export default function LibraryPanel({ onPickAsset, activeSelection }) {
             console.error("library fetch failed", e);
             setLoadError(true);
         } finally { setLoading(false); }
-    };
+    }, []);
 
-    useEffect(() => { refresh(); }, []);
+    useEffect(() => { refresh(); }, [refresh]);
 
     const handleFiles = async (files) => {
         if (!files || !files.length) return;
+        if (!rightsConfirmed) {
+            toast.error("Confirm that you own the assets or have commercial rights first.");
+            return;
+        }
         setUploading(true);
         let completed = 0;
         try {
             for (const f of files) {
                 const fd = new FormData();
                 fd.append("file", f);
+                fd.append("rights_status", "user_owned_attested");
+                fd.append("rights_attestation", "I own or have commercial rights to this asset");
+                fd.append("license_id", "user-attestation-v1");
                 try {
-                    await api.post("/library/upload", fd, {
+                    const { data } = await api.post("/library/upload", fd, {
                         timeout: 0,
                     });
+                    if (!data?.ok || data?.status === "quarantined") {
+                        throw new Error("The asset could not be approved for editing");
+                    }
                     completed += 1;
                 } catch (e) {
                     toast.error(`${f.name}: ${apiErrorMessage(e, "upload failed")}`);
@@ -73,15 +85,19 @@ export default function LibraryPanel({ onPickAsset, activeSelection }) {
                         Your own logos, cutaways, memes, clips. Click any asset to use it as B-roll.
                     </div>
                 </div>
-                <label className="btn-brand cursor-pointer" data-testid="library-upload-btn">
+                <label
+                    className={`btn-brand ${rightsConfirmed ? "cursor-pointer" : "cursor-not-allowed opacity-50"}`}
+                    data-testid="library-upload-btn"
+                >
                     {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
                     {uploading ? "Uploading..." : "Add Assets"}
                     <input
                         ref={inputRef}
                         type="file"
                         multiple
-                        accept="video/*,image/*,.mp4,.mov,.mkv,.webm,.gif,.png,.jpg,.jpeg,.webp"
+                        accept="video/*,image/*,.mp4,.mov,.webm,.gif,.png,.jpg,.jpeg,.webp"
                         className="hidden"
+                        disabled={!rightsConfirmed}
                         onChange={(e) => {
                             handleFiles([...(e.target.files || [])]);
                             e.target.value = "";
@@ -89,6 +105,19 @@ export default function LibraryPanel({ onPickAsset, activeSelection }) {
                     />
                 </label>
             </div>
+
+            <label className="mb-5 flex items-center gap-2 text-xs text-white/60 font-mono cursor-pointer">
+                <input
+                    type="checkbox"
+                    checked={rightsConfirmed}
+                    onChange={(event) => setRightsConfirmed(event.target.checked)}
+                    className="accent-[#CCFF00]"
+                    data-testid="library-rights-confirmation"
+                />
+                I own these assets or have commercial rights to use them.
+            </label>
+
+            <AssetPackStatus niche={niche} onResolved={refresh} />
 
             {loading ? (
                 <div className="panel p-8 text-center text-white/40 font-mono text-sm">Loading...</div>

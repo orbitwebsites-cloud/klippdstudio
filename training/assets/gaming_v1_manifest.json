@@ -1,0 +1,77 @@
+{
+  "schema_version": "klippd.asset_pack.v1",
+  "pack_id": "gaming-v1",
+  "version": "1.0.0",
+  "niche": "gaming",
+  "status": "enabled",
+  "source_priority": [
+    "exact_approved_user",
+    "semantic_approved_user",
+    "official_version_pinned_provider",
+    "generated_original",
+    "no_asset"
+  ],
+  "budgets": {"max_files": 250, "max_file_bytes": 52428800, "max_total_bytes": 1073741824},
+  "archive_policy": "reject_without_extraction",
+  "unknown_rights_policy": "fail_closed_to_quarantine",
+  "randomized_partial_quarantine_rate": 0.1,
+  "sources": [
+    {
+      "source_id": "user_owned_gaming",
+      "priority": 1,
+      "rights_status": "user_owned_attested",
+      "license_id": "user-attestation-required-per-upload",
+      "provenance": "user upload with explicit ownership or commercial-use attestation",
+      "approval": "required_per_asset"
+    },
+    {
+      "source_id": "kenney_cc0_candidate",
+      "priority": 2,
+      "rights_status": "review_only",
+      "license_id": "CC0-1.0-candidate",
+      "provenance": "Kenney pack candidate; bytes and license not vendored",
+      "approval": "disabled_until_version_pinned_human_approval_and_license_vendoring"
+    },
+    {
+      "source_id": "google_fonts_pinned_candidate",
+      "priority": 2,
+      "rights_status": "review_only",
+      "license_id": "per-family-license-required",
+      "provenance": "Google Fonts family candidate; no font bytes vendored",
+      "approval": "disabled_until_family_version_and_license_are_vendored"
+    },
+    {
+      "source_id": "lucide_icons_candidate",
+      "priority": 2,
+      "rights_status": "review_only",
+      "license_id": "ISC-candidate",
+      "provenance": "Lucide generic icon candidate; no icon bytes vendored",
+      "approval": "disabled_until_version_pinned_human_approval_and_license_vendoring"
+    },
+    {
+      "source_id": "klipped_generator",
+      "priority": 3,
+      "rights_status": "generated_editorial",
+      "license_id": "in-house-generated",
+      "provenance": "Klipped Studio generated explanatory editorial graphics and in-house transition/color configurations",
+      "approval": "enabled_with_is_evidence_false"
+    },
+    {
+      "source_id": "openverse_wikimedia_review",
+      "priority": 4,
+      "rights_status": "review_only",
+      "license_id": "per-asset-review-required",
+      "provenance": "metadata discovery only",
+      "approval": "review_queue_no_download_preview_embedding_training_render_or_redistribution"
+    },
+    {
+      "source_id": "freesound_polyhaven_disabled",
+      "priority": 4,
+      "rights_status": "review_only",
+      "license_id": "commercial-terms-review-required",
+      "provenance": "API candidates only; APIs disabled",
+      "approval": "disabled_pending_commercial_terms_review"
+    }
+  ],
+  "assets": []
+}
