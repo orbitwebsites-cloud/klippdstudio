@@ -189,7 +189,7 @@ export default function Landing({ backendOnline }) {
                                 </div>
                                 <div className="h-1 bg-white/10 max-w-md mx-auto">
                                     <div
-                                        className="h-1 bg-[#ccff00] transition-all"
+                                        className="h-1 bg-[#ccff00] transition-[width] duration-200"
                                         style={{ width: `${uploadProgress}%` }}
                                     />
                                 </div>
@@ -305,9 +305,11 @@ function ProjectCard({ project, onOpen, onDelete }) {
             }`}
             data-testid={`project-card-${project.id}`}
         >
-            <div
-                className="aspect-video bg-black relative cursor-pointer flex items-center justify-center"
+            <button
+                type="button"
+                className="aspect-video bg-black relative cursor-pointer flex items-center justify-center w-full text-left"
                 onClick={onOpen}
+                aria-label={`Open ${project.name}`}
             >
                 <div className="text-white/20">
                     <Film className="w-16 h-16" strokeWidth={1} />
@@ -325,21 +327,20 @@ function ProjectCard({ project, onOpen, onDelete }) {
                         </span>
                     )}
                 </div>
-                <button
-                    onClick={onOpen}
-                    className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/40"
-                >
+                <span className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/40" aria-hidden="true">
                     <Play className="w-12 h-12 text-[#ccff00]" strokeWidth={2} />
-                </button>
-            </div>
+                </span>
+            </button>
             <div className="p-4 flex items-start justify-between">
                 <div className="flex-1 min-w-0">
-                    <div
-                        className="font-heading text-lg tracking-wider truncate cursor-pointer hover:text-[#ccff00]"
+                    <button
+                        type="button"
+                        className="font-heading text-lg tracking-wider truncate cursor-pointer hover:text-[#ccff00] text-left max-w-full"
                         onClick={onOpen}
+                        aria-label={`Open ${project.name}`}
                     >
                         {project.name}
-                    </div>
+                    </button>
                     <div className="text-white/40 text-xs font-mono mt-1 flex items-center gap-2">
                         <Clock className="w-3 h-3" />
                         {project.duration ? `${Math.round(project.duration)}s` : "—"}
@@ -347,8 +348,9 @@ function ProjectCard({ project, onOpen, onDelete }) {
                 </div>
                 <button
                     onClick={onDelete}
-                    className="text-white/30 hover:text-[#ff3333] transition"
+                    className="text-white/30 hover:text-[#ff3333] transition min-w-11 min-h-11 inline-flex items-center justify-center"
                     data-testid={`delete-project-${project.id}`}
+                    aria-label={`Delete ${project.name}`}
                 >
                     <Trash2 className="w-4 h-4" />
                 </button>

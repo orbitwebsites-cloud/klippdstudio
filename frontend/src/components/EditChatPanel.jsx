@@ -1,21 +1,22 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ArrowUp, Bot, Check, CornerUpLeft, CornerUpRight, Loader2, Sparkles, X } from "lucide-react";
+import { ArrowUp, Bot, Check, CornerUpLeft, CornerUpRight, Loader2, Sparkles, X, Target, ShieldCheck, Clock3, WandSparkles } from "lucide-react";
 import { toast } from "sonner";
 import {
     apiErrorMessage,
     applyEditChatPreview,
+    featureAccessState,
     getEditChatHistory,
-    isFeatureUnavailable,
     previewEditChat,
     redoEditChat,
     undoEditChat,
 } from "@/lib/klipApi";
 
 const SUGGESTIONS = [
-    "Make the first 10 seconds faster",
-    "Tighten pauses and remove filler words",
-    "Add more impact to the reveal",
-    "Use cleaner captions with key words highlighted",
+    { label: "Build a marketing edit", prompt: "Build a marketing edit with a sharp 5-second hook, bold captions, emphasized keywords, proof moments, and a clear CTA." },
+    { label: "Polish the whole cut", prompt: "Make a polished edit: remove distracting filler and pauses, keep my voice natural, and add clean captions with tasteful emphasis." },
+    { label: "Make it feel viral", prompt: "Turn this into a high-retention short: strengthen the opening, tighten pacing, keep the best moments, and make captions punchy but readable." },
+    { label: "Keep it authentic", prompt: "Clean up the edit while preserving my natural delivery. Remove only distracting pauses and obvious filler, and avoid over-editing." },
+    { label: "Find the best clip", prompt: "Find the strongest 30–60 second moment and shape it into a standalone social clip with a clear hook and satisfying payoff." },
 ];
 
 const historyMessages = (payload) => Array.isArray(payload) ? payload : payload?.messages || payload?.history || [];
@@ -27,8 +28,17 @@ const operationText = (operation) => {
     return range ? `${action} · ${range}` : action;
 };
 
-export default function EditChatPanel({ projectId, creatorProfileId, onApplied }) {
-    const [available, setAvailable] = useState(true);
+const operationMeta = (operation) => {
+    const text = operationText(operation).toLowerCase();
+    if (text.includes("caption")) return { label: "VISUAL", tone: "text-[#ff4f8b]" };
+    if (text.includes("audio") || text.includes("sound") || text.includes("sfx")) return { label: "AUDIO", tone: "text-[#ffb000]" };
+    if (text.includes("b-roll") || text.includes("broll")) return { label: "B-ROLL", tone: "text-[#00d9ff]" };
+    if (text.includes("cut") || text.includes("pause") || text.includes("filler")) return { label: "PACE", tone: "text-[#ccff00]" };
+    return { label: "EDIT", tone: "text-white/50" };
+};
+
+export default function EditChatPanel({ projectId, creatorProfileId, onApplied, suggestedPrompt = "" }) {
+    const [featureState, setFeatureState] = useState("available");
     const [loading, setLoading] = useState(true);
     const [messages, setMessages] = useState([]);
     const [message, setMessage] = useState("");
@@ -46,7 +56,8 @@ export default function EditChatPanel({ projectId, creatorProfileId, onApplied }
             setCanUndo(Boolean(data?.can_undo));
             setCanRedo(Boolean(data?.can_redo));
         } catch (error) {
-            if (isFeatureUnavailable(error)) setAvailable(false);
+            const access = featureAccessState(error);
+            if (access) setFeatureState(access);
             else toast.error(apiErrorMessage(error, "Edit history could not be loaded"));
         } finally {
             setLoading(false);
@@ -54,6 +65,10 @@ export default function EditChatPanel({ projectId, creatorProfileId, onApplied }
     }, [projectId]);
 
     useEffect(() => { loadHistory(); }, [loadHistory]);
+
+    useEffect(() => {
+        if (suggestedPrompt) setMessage(suggestedPrompt);
+    }, [suggestedPrompt]);
 
     const operations = useMemo(() => operationList(preview), [preview]);
 
@@ -71,7 +86,8 @@ export default function EditChatPanel({ projectId, creatorProfileId, onApplied }
             });
             setPreview(data);
         } catch (error) {
-            if (isFeatureUnavailable(error)) setAvailable(false);
+            const access = featureAccessState(error);
+            if (access) setFeatureState(access);
             else {
                 const detail = apiErrorMessage(error, "Klipped could not preview that edit");
                 setErrorMessage(detail);
@@ -98,7 +114,8 @@ export default function EditChatPanel({ projectId, creatorProfileId, onApplied }
             await Promise.all([loadHistory(), Promise.resolve(onApplied?.())]);
             toast.success("Edit applied. You can undo it anytime.");
         } catch (error) {
-            if (isFeatureUnavailable(error)) setAvailable(false);
+            const access = featureAccessState(error);
+            if (access) setFeatureState(access);
             else {
                 const detail = apiErrorMessage(error, "The edit could not be applied");
                 setErrorMessage(detail);
@@ -119,7 +136,8 @@ export default function EditChatPanel({ projectId, creatorProfileId, onApplied }
             await Promise.all([loadHistory(), Promise.resolve(onApplied?.())]);
             toast.success(direction === "undo" ? "Last edit undone" : "Edit restored");
         } catch (error) {
-            if (isFeatureUnavailable(error)) setAvailable(false);
+            const access = featureAccessState(error);
+            if (access) setFeatureState(access);
             else {
                 const detail = apiErrorMessage(error, `Could not ${direction} that edit`);
                 setErrorMessage(detail);
@@ -130,7 +148,22 @@ export default function EditChatPanel({ projectId, creatorProfileId, onApplied }
         }
     };
 
-    if (!available) return null;
+    if (featureState !== "available") {
+        const upgrade = featureState === "upgrade";
+        return (
+            <section className="panel p-5" data-testid="edit-chat-unavailable">
+                <div className="font-mono text-[10px] text-[#ccff00] tracking-widest">// PREMIUM EDIT COPILOT</div>
+                <h2 className="font-display text-3xl tracking-wider mt-2">
+                    {upgrade ? "EDIT COPILOT NEEDS AN UPGRADE" : "EDIT COPILOT UNAVAILABLE"}
+                </h2>
+                <p className="text-white/55 text-sm leading-6 mt-3">
+                    {upgrade
+                        ? "Chat editing is enabled on the backend, but this workspace plan cannot use it yet."
+                        : "Chat editing is part of the editor surface, but this workspace is not serving the premium edit-chat API yet."}
+                </p>
+            </section>
+        );
+    }
 
     return (
         <section className="panel" data-testid="edit-chat-panel">
@@ -171,12 +204,16 @@ export default function EditChatPanel({ projectId, creatorProfileId, onApplied }
                         })}
                     </div>
                 ) : (
-                    <div className="flex flex-wrap gap-2 mb-4">
+                    <div className="mb-5">
+                        <div className="flex items-center gap-2 text-[10px] font-mono tracking-widest text-white/40 mb-3"><Target className="w-3 h-3 text-[#ccff00]" /> START WITH A GOAL</div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                         {SUGGESTIONS.map((suggestion) => (
-                            <button key={suggestion} type="button" onClick={() => requestPreview(suggestion)} className="style-pill !text-[10px] !py-2 text-left" disabled={working}>
-                                <Sparkles className="w-3 h-3" /> {suggestion}
+                            <button key={suggestion.label} type="button" onClick={() => requestPreview(suggestion.prompt)} className="group text-left border border-white/10 bg-white/[0.02] px-3 py-3 transition hover:border-[#ccff00]/60 hover:bg-[#ccff00]/[0.05]" disabled={working}>
+                                <span className="flex items-center gap-2 text-xs text-white/80"><Sparkles className="w-3 h-3 text-[#ccff00]" /> {suggestion.label}</span>
+                                <span className="block mt-1 text-[10px] leading-4 text-white/35 group-hover:text-white/55">{suggestion.prompt}</span>
                             </button>
                         ))}
+                        </div>
                     </div>
                 )}
 
@@ -184,18 +221,25 @@ export default function EditChatPanel({ projectId, creatorProfileId, onApplied }
                     <div className="border border-[#ccff00]/50 bg-[#ccff00]/[0.03] mb-4" data-testid="edit-chat-preview">
                         <div className="px-4 py-3 border-b border-[#ccff00]/20 flex items-center justify-between gap-2">
                             <div>
-                                <div className="font-mono text-[10px] text-[#ccff00] tracking-widest">PREVIEW · NOT APPLIED</div>
-                                <div className="text-sm text-white/75 mt-1">{preview.summary || preview.message || `${operations.length} timeline operation${operations.length === 1 ? "" : "s"}`}</div>
+                                <div className="font-mono text-[10px] text-[#ccff00] tracking-widest">EDIT PLAN · REVIEW BEFORE APPLY</div>
+                                <div className="text-sm text-white/80 mt-1">{preview.summary || preview.message || `${operations.length} timeline operation${operations.length === 1 ? "" : "s"}`}</div>
                             </div>
                             <button type="button" onClick={() => setPreview(null)} className="text-white/40 hover:text-white" aria-label="Cancel preview"><X className="w-4 h-4" /></button>
                         </div>
+                        <div className="grid grid-cols-3 border-b border-white/10 bg-black/20">
+                            <div className="px-3 py-3 border-r border-white/10"><div className="text-[9px] font-mono text-white/35 tracking-widest">CHANGES</div><div className="mt-1 text-lg font-display text-[#ccff00]">{operations.length}</div></div>
+                            <div className="px-3 py-3 border-r border-white/10"><div className="text-[9px] font-mono text-white/35 tracking-widest">SCOPE</div><div className="mt-1 text-xs text-white/70">{preview.scope || "Whole cut"}</div></div>
+                            <div className="px-3 py-3"><div className="text-[9px] font-mono text-white/35 tracking-widest">READY IN</div><div className="mt-1 text-xs text-white/70 flex items-center gap-1"><Clock3 className="w-3 h-3 text-[#ccff00]" /> {preview.estimated_time || "One render"}</div></div>
+                        </div>
                         <div className="px-4 py-3 space-y-2">
                             {operations.length > 0 ? operations.map((operation, index) => (
-                                <div key={operation?.id || index} className="grid grid-cols-[24px_1fr] gap-2 text-xs text-white/65">
-                                    <span className="font-mono text-[#ccff00]">{String(index + 1).padStart(2, "0")}</span>
-                                    <span>{operationText(operation)}</span>
+                                <div key={operation?.id || index} className="flex items-start gap-3 border border-white/10 bg-white/[0.02] px-3 py-2.5 text-xs text-white/70">
+                                    <span className="font-mono text-[#ccff00] pt-0.5">{String(index + 1).padStart(2, "0")}</span>
+                                    <div className="min-w-0 flex-1"><span className={`block text-[9px] font-mono tracking-widest ${operationMeta(operation).tone}`}>{operationMeta(operation).label}</span><span className="block mt-1">{operationText(operation)}</span></div>
+                                    <ShieldCheck className="w-4 h-4 shrink-0 text-[#ccff00]/70" aria-label="Reviewable operation" />
                                 </div>
                             )) : <div className="text-xs text-white/50">Klipped prepared this change. Apply to update the timeline.</div>}
+                            {(preview.warnings || preview.assumptions) && <div className="mt-3 border-l-2 border-[#ffb000] bg-[#ffb000]/[0.06] px-3 py-2 text-[11px] leading-5 text-white/60"><div className="flex items-center gap-2 text-[#ffb000] font-mono text-[9px] tracking-widest"><WandSparkles className="w-3 h-3" /> NOTES FROM KLIPPED</div>{Array.isArray(preview.warnings || preview.assumptions) ? (preview.warnings || preview.assumptions).join(" ") : (preview.warnings || preview.assumptions)}</div>}
                         </div>
                         <div className="px-4 py-3 border-t border-white/10 flex justify-end gap-2">
                             <button type="button" className="btn-ghost" onClick={() => setPreview(null)} disabled={working} data-testid="edit-chat-cancel"><X className="w-4 h-4" /> Cancel</button>
@@ -231,7 +275,7 @@ export default function EditChatPanel({ projectId, creatorProfileId, onApplied }
                         {working ? <Loader2 className="w-4 h-4 animate-spin" /> : <ArrowUp className="w-4 h-4" />}
                     </button>
                 </form>
-                <div className="font-mono text-[9px] text-white/30 mt-2 tracking-widest">ENTER TO PREVIEW · SHIFT+ENTER FOR NEW LINE · APPLY, CANCEL, OR UNDO ANY CHANGE</div>
+                <div className="font-mono text-[9px] text-white/30 mt-2 tracking-widest">ENTER TO BUILD A PLAN · SHIFT+ENTER FOR NEW LINE · APPLY, CANCEL, OR UNDO ANY CHANGE</div>
             </div>
         </section>
     );

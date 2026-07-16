@@ -95,7 +95,9 @@ body::before {
 button:focus-visible,
 a:focus-visible,
 [role="button"]:focus-visible,
-input:focus-visible {
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
   outline: 2px solid var(--brand);
   outline-offset: 3px;
 }
@@ -230,6 +232,16 @@ input:focus-visible {
   background: #d4af37;
   color: #050505;
   border-color: #d4af37;
+}
+.style-pill.active-marketing {
+  background: #ffd400;
+  color: #050505;
+  border-color: #ffd400;
+}
+.style-pill.active-editorial {
+  background: #f4f1ea;
+  color: #050505;
+  border-color: #f4f1ea;
 }
 
 /* Loading kinetic text */

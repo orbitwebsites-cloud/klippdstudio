@@ -2,9 +2,12 @@
 import json
 import logging
 import re
+import asyncio
+import os
 import httpx
 from openai import AsyncOpenAI
 from typing import List, Dict, Any, Optional
+from virality_scoring import fallback_candidates, rank_candidates
 from editing_profiles import profile_prompt
 from editing_intelligence import (
     build_revision_prompt,
@@ -19,6 +22,7 @@ logger = logging.getLogger(__name__)
 # ---------- MODEL CONFIG ----------
 GROQ_BASE = "https://api.groq.com/openai/v1"
 CEREBRAS_BASE = "https://api.cerebras.ai/v1"
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 # Best models per task (Jan 2026)
 WHISPER_MODEL = "whisper-large-v3-turbo"
@@ -26,6 +30,22 @@ GROQ_TEXT_MODEL = "llama-3.3-70b-versatile"
 GROQ_TEXT_MODEL_FALLBACK = "llama-3.1-8b-instant"
 CEREBRAS_TEXT_MODEL = "gpt-oss-120b"
 CEREBRAS_TEXT_MODEL_FALLBACK = "zai-glm-4.7"
+GEMINI_TEXT_MODEL = "gemini-2.5-flash-lite"
+
+# Keep provider bursts below typical free-tier limits. This is per process;
+# multi-worker deployments should also enforce a shared queue/rate limiter.
+AI_MAX_CONCURRENCY = max(1, int(os.environ.get("AI_MAX_CONCURRENCY", "2")))
+_groq_semaphore = asyncio.Semaphore(AI_MAX_CONCURRENCY)
+_cerebras_semaphore = asyncio.Semaphore(AI_MAX_CONCURRENCY)
+_gemini_semaphore = asyncio.Semaphore(AI_MAX_CONCURRENCY)
+
+
+def _provider_semaphore(base_url: str) -> asyncio.Semaphore:
+    if base_url == CEREBRAS_BASE:
+        return _cerebras_semaphore
+    if base_url == GEMINI_BASE:
+        return _gemini_semaphore
+    return _groq_semaphore
 
 
 # ---------- TRANSCRIPTION ----------
@@ -34,14 +54,15 @@ async def transcribe_audio(audio_path: str, groq_key: str) -> Dict[str, Any]:
     if not groq_key:
         raise RuntimeError("Groq API key required for transcription.")
 
-    client = AsyncOpenAI(api_key=groq_key, base_url=GROQ_BASE, timeout=180.0)
-    with open(audio_path, "rb") as f:
-        resp = await client.audio.transcriptions.create(
-            file=(audio_path.split("/")[-1], f, "audio/mpeg"),
-            model=WHISPER_MODEL,
-            response_format="verbose_json",
-            timestamp_granularities=["word", "segment"],
-        )
+    async with _groq_semaphore:
+        client = AsyncOpenAI(api_key=groq_key, base_url=GROQ_BASE, timeout=180.0)
+        with open(audio_path, "rb") as f:
+            resp = await client.audio.transcriptions.create(
+                file=(audio_path.split("/")[-1], f, "audio/mpeg"),
+                model=WHISPER_MODEL,
+                response_format="verbose_json",
+                timestamp_granularities=["word", "segment"],
+            )
     data = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
     return {
         "text": data.get("text", ""),
@@ -59,7 +80,8 @@ async def _call_openai_compat(base_url: str, api_key: str, model: str,
     kwargs = {"model": model, "messages": messages, "temperature": 0.2}
     if response_format:
         kwargs["response_format"] = response_format
-    res = await client.chat.completions.create(**kwargs)
+    async with _provider_semaphore(base_url):
+        res = await client.chat.completions.create(**kwargs)
     return res.choices[0].message.content or ""
 
 
@@ -78,6 +100,7 @@ async def call_text_llm(prompt: str, keys: dict, system: str = "",
         ("groq", GROQ_BASE, keys.get("groq"), GROQ_TEXT_MODEL_FALLBACK),
         ("cerebras", CEREBRAS_BASE, keys.get("cerebras"), CEREBRAS_TEXT_MODEL),
         ("cerebras", CEREBRAS_BASE, keys.get("cerebras"), CEREBRAS_TEXT_MODEL_FALLBACK),
+        ("gemini", GEMINI_BASE, keys.get("gemini"), GEMINI_TEXT_MODEL),
     ]
 
     last_err = None
@@ -354,8 +377,11 @@ Treat this profile as general editorial guidance, not a request to imitate a cre
 
 
 # ---------- VIRAL CLIP EXTRACTION ----------
-async def extract_viral_clips(words: List[Dict], keys: dict, duration: float) -> List[Dict[str, Any]]:
-    """Ask LLM to find the 3-5 punchiest self-contained short-clip moments."""
+async def extract_viral_clips(
+    words: List[Dict], keys: dict, duration: float,
+    audio_frames: Optional[List[Dict[str, Any]]] = None, niche: str = "general",
+) -> List[Dict[str, Any]]:
+    """Generate, repair, score, de-duplicate, and rank short-form clip candidates."""
     if not words:
         return []
 
@@ -370,7 +396,7 @@ async def extract_viral_clips(words: List[Dict], keys: dict, duration: float) ->
 
     system = (
         "You are a viral short-form video expert (TikTok/Reels/Shorts). "
-        "You identify the most captivating, self-contained ~20-45 second moments "
+        f"You identify the most captivating, self-contained ~20-45 second moments for {niche} creators "
         "from a longer transcript. You reply ONLY with valid JSON."
     )
 
@@ -387,50 +413,32 @@ Return JSON:
       "end_word_index": <int>,
       "hook": "<the punchy opening line, max 12 words>",
       "caption": "<viral-style caption with 2-3 emojis, max 100 chars>",
-      "score": <int 1-100, higher = more viral>,
+      "editorial_score": <int 1-100 for story, payoff and shareability>,
+      "hook_options": ["<three stronger opening text options, max 12 words each>"],
+      "caption_options": ["<three platform caption options, max 100 chars each>"],
       "reason": "<why this works, max 20 words>"
     }}
   ]
 }}
 
 Rules:
-- 3 to 5 clips total, ranked best first.
+- 5 to 8 candidates total. A deterministic scorer will validate and rank them.
 - Each clip should be 20-60 seconds long (based on word timestamps).
 - Prefer moments with strong hooks, controversy, humor, insight, or emotion.
 - Skip filler-heavy sections.
 - Return ONLY the JSON.
 """
-    raw = await call_text_llm(prompt, keys, system=system, want_json=True)
-    parsed = _extract_json(raw)
-    clips_in = parsed.get("clips", []) if isinstance(parsed, dict) else []
-
-    results = []
-    for c in clips_in[:5]:
-        if not isinstance(c, dict):
-            continue
-        try:
-            si = int(c.get("start_word_index", 0))
-            ei = int(c.get("end_word_index", 0))
-            if si < 0 or ei <= si or si >= len(words) or ei >= len(words):
-                continue
-            start = float(words[si].get("start", 0))
-            end = float(words[ei].get("end", start + 30))
-            if end - start < 5 or end - start > 120:
-                continue
-            results.append({
-                "start_word_index": si,
-                "end_word_index": ei,
-                "start": round(start, 2),
-                "end": round(end, 2),
-                "duration": round(end - start, 2),
-                "hook": str(c.get("hook", ""))[:200],
-                "caption": str(c.get("caption", ""))[:200],
-                "score": int(c.get("score", 50)),
-                "reason": str(c.get("reason", ""))[:300],
-            })
-        except (ValueError, TypeError):
-            continue
-    return results
+    clips_in: List[Dict[str, Any]] = []
+    try:
+        raw = await call_text_llm(prompt, keys, system=system, want_json=True)
+        parsed = _extract_json(raw)
+        if isinstance(parsed, dict) and isinstance(parsed.get("clips"), list):
+            clips_in = [clip for clip in parsed["clips"][:8] if isinstance(clip, dict)]
+    except Exception as exc:
+        logger.warning("LLM clip selection failed; using deterministic candidates: %s", exc)
+    if not clips_in:
+        clips_in = fallback_candidates(words, duration)
+    return rank_candidates(clips_in, words, audio_frames, niche=niche, limit=5)
 
 
 # ---------- CONNECTION TESTS ----------

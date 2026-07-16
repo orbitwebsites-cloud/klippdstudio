@@ -1,13 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Upload, Loader2, Trash2, Image as ImageIcon, Film, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
-import { API, apiErrorMessage } from "@/lib/klipApi";
-import axios from "axios";
+import api, { API, apiErrorMessage } from "@/lib/klipApi";
 import AssetPackStatus from "@/components/AssetPackStatus";
 
-const api = axios.create({ baseURL: API });
-
-export default function LibraryPanel({ onPickAsset, activeSelection, niche = "gaming" }) {
+export default function LibraryPanel({ onPickAsset, activeSelection, niche = "gaming", standalone = false }) {
     const [items, setItems] = useState([]);
     const [uploading, setUploading] = useState(false);
     const [rightsConfirmed, setRightsConfirmed] = useState(false);
@@ -82,7 +79,9 @@ export default function LibraryPanel({ onPickAsset, activeSelection, niche = "ga
                     <div className="font-mono text-xs text-white/40 tracking-widest mb-2">// PERSONAL VAULT</div>
                     <div className="font-display text-3xl tracking-wider">MY LIBRARY</div>
                     <div className="text-white/50 text-sm mt-1">
-                        Your own logos, cutaways, memes, clips. Click any asset to use it as B-roll.
+                        {standalone
+                            ? "Your own logos, cutaways, memes, clips, and approved B-roll assets."
+                            : "Your own logos, cutaways, memes, clips. Pick an asset for the selected B-roll moment."}
                     </div>
                 </div>
                 <label
@@ -145,53 +144,62 @@ export default function LibraryPanel({ onPickAsset, activeSelection, niche = "ga
                     {items.map((it) => {
                         const selected = activeSelection?.id === it.id;
                         return (
-                            <div
+                            <article
                                 key={it.id}
-                                className="panel relative group cursor-pointer overflow-hidden"
+                                className="panel relative group overflow-hidden"
                                 style={{ borderColor: selected ? "#CCFF00" : "rgba(255,255,255,0.1)" }}
                                 data-testid={`library-item-${it.id}`}
-                                onClick={() => onPickAsset?.(it)}
                             >
-                                <div className="aspect-square bg-black flex items-center justify-center overflow-hidden">
-                                    {it.kind === "image" ? (
-                                        <img
-                                            src={assetUrl(it.url)}
-                                            alt={it.name}
-                                            className="w-full h-full object-cover"
-                                        />
-                                    ) : (
-                                        <video
-                                            src={assetUrl(it.url)}
-                                            muted
-                                            loop
-                                            playsInline
-                                            onMouseEnter={(e) => e.target.play?.().catch(() => {})}
-                                            onMouseLeave={(e) => e.target.pause?.()}
-                                            className="w-full h-full object-cover"
-                                        />
-                                    )}
-                                </div>
-                                <div className="px-2 py-1.5 flex items-center gap-1.5">
-                                    {it.kind === "image" ? (
-                                        <ImageIcon className="w-3 h-3 text-white/40 flex-shrink-0" />
-                                    ) : (
-                                        <Film className="w-3 h-3 text-white/40 flex-shrink-0" />
-                                    )}
-                                    <div className="font-mono text-[10px] text-white/60 truncate flex-1">
-                                        {it.name}
+                                <button
+                                    type="button"
+                                    disabled={!onPickAsset}
+                                    className={`block w-full text-left ${onPickAsset ? "cursor-pointer" : "cursor-default"}`}
+                                    aria-label={onPickAsset ? `Use ${it.name} as B-roll` : `${it.name} library asset`}
+                                    aria-pressed={onPickAsset ? selected : undefined}
+                                    onClick={() => onPickAsset?.(it)}
+                                >
+                                    <div className="aspect-square bg-black flex items-center justify-center overflow-hidden">
+                                        {it.kind === "image" ? (
+                                            <img
+                                                src={assetUrl(it.url)}
+                                                alt={it.name}
+                                                className="w-full h-full object-cover"
+                                            />
+                                        ) : (
+                                            <video
+                                                src={assetUrl(it.url)}
+                                                muted
+                                                loop
+                                                playsInline
+                                                onMouseEnter={(e) => e.target.play?.().catch(() => {})}
+                                                onMouseLeave={(e) => e.target.pause?.()}
+                                                className="w-full h-full object-cover"
+                                            />
+                                        )}
                                     </div>
-                                </div>
+                                    <div className="px-2 py-1.5 flex items-center gap-1.5">
+                                        {it.kind === "image" ? (
+                                            <ImageIcon className="w-3 h-3 text-white/40 flex-shrink-0" />
+                                        ) : (
+                                            <Film className="w-3 h-3 text-white/40 flex-shrink-0" />
+                                        )}
+                                        <div className="font-mono text-[10px] text-white/60 truncate flex-1">
+                                            {it.name}
+                                        </div>
+                                    </div>
+                                </button>
                                 <button
                                     onClick={(e) => { e.stopPropagation(); deleteItem(it.name); }}
-                                    className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 bg-black/70 p-1 hover:bg-[#ff3333] transition-all"
+                                    className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 bg-black/70 p-1 hover:bg-[#ff3333] transition-[opacity,background-color] duration-150"
                                     data-testid={`library-delete-${it.id}`}
+                                    aria-label={`Delete ${it.name}`}
                                 >
                                     <Trash2 className="w-3 h-3" />
                                 </button>
                                 {selected && (
                                     <div className="absolute inset-0 border-2 border-[#CCFF00] pointer-events-none" />
                                 )}
-                            </div>
+                            </article>
                         );
                     })}
                 </div>

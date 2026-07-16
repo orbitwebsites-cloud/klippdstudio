@@ -29,10 +29,11 @@ import mimetypes
 import uuid
 import shutil
 import asyncio
+import time
 import aiofiles
 import stripe
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 import ai_services as ai
 import asset_generator
@@ -52,7 +53,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", str(ROOT_DIR.parent / "data"))).resol
 SFX_DIR = os.environ.get("SFX_DIR", str(ROOT_DIR / "assets" / "sfx"))
 LIBRARY_DIR = DATA_DIR / "library"
 ASSET_QUARANTINE_DIR = DATA_DIR / "quarantine"
-for sub in ("videos", "audio", "output", "subtitles", "broll", "library"):
+for sub in ("videos", "audio", "output", "subtitles", "broll", "music", "library"):
     (DATA_DIR / sub).mkdir(parents=True, exist_ok=True)
 ASSET_MANAGER = AssetPackManager(LIBRARY_DIR, ASSET_QUARANTINE_DIR)
 ASSET_ORCHESTRATOR = AssetProviderOrchestrator(ASSET_MANAGER)
@@ -94,7 +95,7 @@ USER_ID = "default_user"  # single-user MVP
 
 PLAN_POLICIES = {
     "basic": {"price_usd_monthly": 19, "retention_days": 7},
-    "pro": {"price_usd_monthly": 49, "retention_days": 30},
+    "pro": {"price_usd_monthly": 29, "retention_days": 30},
     "elite": {"price_usd_monthly": 149, "retention_days": None},
     "enterprise": {"price_usd_per_seat_monthly": 120, "retention_days": None},
 }
@@ -241,6 +242,8 @@ async def seed_keys_from_env():
         seed["groq"] = os.environ["SEED_GROQ_KEY"]
     if os.environ.get("SEED_CEREBRAS_KEY") and not existing.get("cerebras"):
         seed["cerebras"] = os.environ["SEED_CEREBRAS_KEY"]
+    if os.environ.get("SEED_GEMINI_KEY") and not existing.get("gemini"):
+        seed["gemini"] = os.environ["SEED_GEMINI_KEY"]
     if seed:
         await save_keys(seed)
         logger.info(f"Seeded missing keys from env: {list(seed.keys())}")
@@ -258,13 +261,17 @@ async def restore_stripe_subscription():
 # ---------- MODELS ----------
 class RenderOptions(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    style: Literal["tiktok", "youtube", "luxury"] = "tiktok"
+    style: Literal["tiktok", "youtube", "luxury", "marketing", "editorial"] = "tiktok"
     aspect: Literal["16:9", "9:16", "1:1"] = "16:9"
     remove_fillers: bool = True
+    remove_silences: bool = False
+    silence_threshold: float = Field(default=0.8, ge=0.3, le=3.0)
     captions: bool = True
     sfx: bool = True
     zoom_ins: bool = True
     broll: bool = True
+    background_music: bool = False
+    background_music_volume: float = Field(default=0.16, ge=0.0, le=0.5)
     excluded_filler_indices: List[int] = Field(default_factory=list)
     added_filler_indices: List[int] = Field(default_factory=list)
     selected_broll: List[Dict[str, Any]] = Field(default_factory=list)
@@ -286,19 +293,29 @@ class RenderOptions(BaseModel):
 class EditOptions(BaseModel):
     """Persist the editor controls before a final render is requested."""
     model_config = ConfigDict(extra="ignore")
-    style: Literal["tiktok", "youtube", "luxury"] = "tiktok"
+    style: Literal["tiktok", "youtube", "luxury", "marketing", "editorial"] = "tiktok"
     aspect: Literal["16:9", "9:16", "1:1"] = "16:9"
     remove_fillers: bool = True
+    remove_silences: bool = False
+    silence_threshold: float = Field(default=0.8, ge=0.3, le=3.0)
     captions: bool = True
     sfx: bool = True
     zoom_ins: bool = True
     broll: bool = True
+    background_music: bool = False
+    background_music_volume: float = Field(default=0.16, ge=0.0, le=0.5)
 
 
 class AnalyzeBody(BaseModel):
     model_config = ConfigDict(extra="ignore")
     requested_profile: Optional[Literal["general", "gaming", "minecraft_narrative", "talking_head"]] = None
     training_profile_id: Optional[str] = Field(default=None, max_length=64)
+
+
+class AssetPackResolveBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    niche: str = Field(default="gaming", min_length=2, max_length=40)
+    tags: List[str] = Field(default_factory=list, max_length=20)
 
 
 class CheckoutBody(BaseModel):
@@ -332,6 +349,21 @@ async def update_project(pid: str, **fields) -> None:
     await db.projects.update_one({"id": pid}, {"$set": fields})
 
 
+def _matched_count(result: Any) -> int:
+    if isinstance(result, dict):
+        return int(result.get("matched_count") or 0)
+    return int(getattr(result, "matched_count", 0) or 0)
+
+
+async def transition_project_status(pid: str, blocked_statuses: set[str], **fields) -> bool:
+    fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    result = await db.projects.update_one(
+        {"id": pid, "status": {"$nin": list(blocked_statuses)}},
+        {"$set": fields},
+    )
+    return _matched_count(result) > 0
+
+
 async def get_project(pid: str) -> Dict:
     doc = await db.projects.find_one({"id": pid}, {"_id": 0})
     if not doc:
@@ -341,7 +373,7 @@ async def get_project(pid: str) -> Dict:
 
 def _remove_project_files(doc: Dict[str, Any]) -> None:
     """Remove only this project's files, including auxiliary clip renders."""
-    paths = [doc.get(key) for key in ("original_path", "audio_path", "output_path")]
+    paths = [doc.get(key) for key in ("original_path", "audio_path", "output_path", "background_music_path")]
     paths.extend((doc.get("viral_renders") or {}).values())
     pid = str(doc.get("id") or "")
     if pid:
@@ -489,6 +521,35 @@ def _clean_training_principles(values: List[str]) -> List[str]:
     return cleaned
 
 
+def _canonical_training_url(value: Optional[str]) -> Optional[str]:
+    """Normalize reference URLs so tracking parameters cannot create duplicates."""
+    if not value:
+        return None
+    parsed = urlparse(value.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    host = parsed.netloc.lower()
+    tracking_keys = {"fbclid", "gclid", "igshid", "mc_cid", "mc_eid", "si"}
+    filtered_query = [
+        (key, val)
+        for key, val in parse_qsl(parsed.query, keep_blank_values=True)
+        if not key.lower().startswith("utm_") and key.lower() not in tracking_keys
+    ]
+    if host in {"youtu.be", "www.youtu.be"}:
+        video_id = parsed.path.strip("/").split("/")[0]
+        if video_id:
+            query = urlencode(sorted([("v", video_id), *filtered_query]), doseq=True)
+            return urlunparse(("https", "www.youtube.com", "/watch", "", query, ""))
+    if host in {"youtube.com", "www.youtube.com", "m.youtube.com"} and parsed.path == "/watch":
+        video_id = parse_qs(parsed.query).get("v", [""])[0]
+        if video_id:
+            query_items = [("v", video_id), *[(key, val) for key, val in filtered_query if key != "v"]]
+            query = urlencode(sorted(query_items), doseq=True)
+            return urlunparse(("https", "www.youtube.com", "/watch", "", query, ""))
+    query = urlencode(sorted(filtered_query), doseq=True)
+    return urlunparse((parsed.scheme.lower(), host, parsed.path.rstrip("/") or "/", "", query, ""))
+
+
 async def _training_context(profile_id: Optional[str]) -> tuple[Optional[Dict[str, Any]], str]:
     if not profile_id:
         return None, ""
@@ -537,6 +598,13 @@ def _safe_data_file(candidate: str) -> Optional[str]:
         return None
 
 
+def _safe_project_file(candidate: Optional[str], media_type: str, filename: Optional[str] = None) -> FileResponse:
+    safe = _safe_data_file(candidate or "")
+    if not safe:
+        raise HTTPException(404)
+    return FileResponse(safe, media_type=media_type, filename=filename)
+
+
 # ---------- ROUTES ----------
 @api.get("/")
 async def root():
@@ -546,19 +614,29 @@ async def root():
 @api.get("/health")
 async def health():
     """Deployment readiness check for database, FFmpeg and persistent storage."""
-    checks = {
-        "ffmpeg": bool(shutil.which("ffmpeg") and shutil.which("ffprobe")),
-        "storage": DATA_DIR.exists() and os.access(DATA_DIR, os.W_OK),
-        "database": False,
-    }
-    try:
-        await db.command("ping")
-        checks["database"] = True
-    except Exception:
-        pass
-    if not all(checks.values()):
-        raise HTTPException(503, detail={"ok": False, "checks": checks})
-    return {"ok": True, "checks": checks}
+    now = time.monotonic()
+    cached = getattr(health, "_cache", None)
+    if cached and now - cached[0] < 5:
+        return cached[1]
+    async with health_lock:
+        cached = getattr(health, "_cache", None)
+        if cached and time.monotonic() - cached[0] < 5:
+            return cached[1]
+        checks = {
+            "ffmpeg": bool(shutil.which("ffmpeg") and shutil.which("ffprobe")),
+            "storage": DATA_DIR.exists() and os.access(DATA_DIR, os.W_OK),
+            "database": False,
+        }
+        try:
+            await db.command("ping")
+            checks["database"] = True
+        except Exception:
+            pass
+        if not all(checks.values()):
+            raise HTTPException(503, detail={"ok": False, "checks": checks})
+        result = {"ok": True, "checks": checks}
+        health._cache = (time.monotonic(), result)
+        return result
 
 
 @api.get("/subscription")
@@ -583,6 +661,10 @@ async def subscription_status():
 async def create_checkout(body: CheckoutBody):
     if not STRIPE_SECRET_KEY:
         raise HTTPException(503, "Billing is not configured")
+    settings = await db.settings.find_one({"user_id": USER_ID}) or {}
+    billing_subscription = settings.get("billing_subscription") or {}
+    if billing_subscription.get("customer_id") and billing_subscription.get("status") in {"active", "trialing", "past_due"}:
+        raise HTTPException(409, "This workspace already has an active Stripe subscription. Use billing management instead.")
     price_id = _stripe_price_id(body.plan)
     if not price_id:
         raise HTTPException(503, f"Billing is not configured for the {body.plan.title()} plan")
@@ -645,13 +727,23 @@ async def stripe_webhook(request: Request):
 @api.get("/training/dashboard")
 async def training_dashboard():
     references = await db.training_references.find({"user_id": USER_ID}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    unique_references = []
+    seen_reference_urls = set()
+    for reference in references:
+        canonical_url = _canonical_training_url(reference.get("source_url"))
+        if canonical_url and canonical_url in seen_reference_urls:
+            continue
+        if canonical_url:
+            seen_reference_urls.add(canonical_url)
+            reference = {**reference, "source_url": canonical_url}
+        unique_references.append(reference)
     profiles = await db.training_profiles.find({"user_id": USER_ID}, {"_id": 0}).sort("updated_at", -1).to_list(100)
     return {
         "policy": "References are editorial research and annotations, not uploaded creator footage or model fine-tuning data.",
-        "references": references,
+        "references": unique_references,
         "profiles": profiles,
         "stats": {
-            "references": len(references),
+            "references": len(unique_references),
             "active_profiles": sum(1 for profile in profiles if profile.get("status") == "active"),
             "approved_principles": sum(len(profile.get("principles", [])) for profile in profiles),
         },
@@ -660,14 +752,24 @@ async def training_dashboard():
 
 @api.post("/training/references")
 async def create_training_reference(body: TrainingReferenceBody):
+    async with training_reference_lock:
+        return await _create_training_reference_locked(body)
+
+
+async def _create_training_reference_locked(body: TrainingReferenceBody):
+    source_url = body.source_url.strip() if body.source_url else None
     if body.source_url:
-        parsed = urlparse(body.source_url)
+        parsed = urlparse(source_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise HTTPException(400, "Reference link must be a valid http(s) URL")
+        source_url = _canonical_training_url(source_url)
+        existing_references = await db.training_references.find({"user_id": USER_ID}, {"_id": 0}).to_list(1000)
+        if any(_canonical_training_url(item.get("source_url")) == source_url for item in existing_references):
+            raise HTTPException(409, "A training reference for this URL already exists")
     principles = _clean_training_principles(body.principles)
     record = {
         "id": f"ref_{uuid.uuid4().hex[:12]}", "user_id": USER_ID,
-        "title": body.title.strip(), "source_url": body.source_url.strip() if body.source_url else None,
+        "title": body.title.strip(), "source_url": source_url,
         "niche": body.niche.strip().lower(), "game": body.game.strip() if body.game else None,
         "rights_status": body.rights_status, "notes": body.notes.strip(), "principles": principles,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -780,6 +882,8 @@ async def list_projects():
 UPLOAD_TMP = DATA_DIR / "uploads_tmp"
 UPLOAD_TMP.mkdir(parents=True, exist_ok=True)
 upload_locks: Dict[str, asyncio.Lock] = {}
+training_reference_lock = asyncio.Lock()
+health_lock = asyncio.Lock()
 
 
 def _upload_lock(upload_id: str) -> asyncio.Lock:
@@ -866,10 +970,11 @@ async def upload_chunk(upload_id: str, index: int, file: UploadFile = File(...))
 async def upload_status(upload_id: str):
     """Get upload session status — used for resume."""
     manifest_path = UPLOAD_TMP / upload_id / "manifest.json"
-    if not manifest_path.exists():
-        raise HTTPException(404, "Upload session not found")
-    async with aiofiles.open(manifest_path, "r") as f:
-        m = json.loads(await f.read())
+    async with _upload_lock(upload_id):
+        if not manifest_path.exists():
+            raise HTTPException(404, "Upload session not found")
+        async with aiofiles.open(manifest_path, "r") as f:
+            m = json.loads(await f.read())
     return {
         "upload_id": upload_id,
         "filename": m.get("filename"),
@@ -1138,15 +1243,20 @@ async def _run_analysis(pid: str):
 @api.post("/projects/{pid}/analyze")
 async def analyze(pid: str, bg: BackgroundTasks, body: Optional[AnalyzeBody] = None):
     proj = await get_project(pid)
-    if proj["status"] in ("transcribing", "analyzing", "extracting_audio", "rendering"):
+    active_statuses = {"queued", "extracting_audio", "transcribing", "analyzing", "queued_render", "rendering"}
+    if proj["status"] in active_statuses:
         return {"ok": True, "status": proj["status"], "already_running": True}
     body = body or AnalyzeBody()
     if body.training_profile_id:
         await _training_context(body.training_profile_id)
-    await update_project(
+    queued = await transition_project_status(
         pid, status="queued", status_message="Queued for analysis...", progress=1,
         requested_profile=body.requested_profile, training_profile_id=body.training_profile_id,
+        blocked_statuses=active_statuses,
     )
+    if not queued:
+        latest = await get_project(pid)
+        return {"ok": True, "status": latest.get("status"), "already_running": True}
     bg.add_task(_run_analysis, pid)
     return {"ok": True, "status": "queued"}
 
@@ -1273,7 +1383,10 @@ async def asset_pack_status():
 
 
 @api.post("/asset-packs/resolve")
-async def asset_pack_resolve(niche: str = "gaming", tags: str = ""):
+async def asset_pack_resolve(body: Optional[AssetPackResolveBody] = None, niche: str = "gaming", tags: str = ""):
+    if body:
+        selected_tags = [re.sub(r"\s+", " ", str(item)).strip()[:40] for item in body.tags if str(item).strip()]
+        return await ASSET_ORCHESTRATOR.resolve(body.niche, selected_tags)
     selected_tags = [item.strip() for item in tags.split(",") if item.strip()]
     return await ASSET_ORCHESTRATOR.resolve(niche, selected_tags)
 
@@ -1373,10 +1486,44 @@ async def broll_upload(
     }
 
 
+@api.post("/projects/{pid}/music_upload")
+async def music_upload(
+    pid: str,
+    file: UploadFile = File(...),
+    rights_status: str = Form("unknown"),
+    rights_attestation: str = Form(""),
+):
+    """Attach one user-owned/licensed music bed to a project."""
+    await get_project(pid)
+    ext = os.path.splitext(file.filename or "track.mp3")[1].lower() or ".mp3"
+    if ext not in {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}:
+        raise HTTPException(400, f"Unsupported music type: {ext}")
+    attested = (
+        rights_status == "user_owned_attested"
+        and rights_attestation.strip() == "I own or have commercial rights to this asset"
+    )
+    if not attested:
+        raise HTTPException(400, "Music rights attestation is required")
+    dst = DATA_DIR / "music" / f"{pid}_{uuid.uuid4().hex[:10]}{ext}"
+    await _save_upload(file, dst, MAX_ASSET_BYTES)
+    try:
+        meta = vp.probe_audio(str(dst))
+    except Exception as exc:
+        dst.unlink(missing_ok=True)
+        raise HTTPException(400, f"Could not read music file: {str(exc)[:200]}") from exc
+    previous = (await get_project(pid)).get("background_music_path")
+    await update_project(pid, background_music_path=str(dst), background_music_name=file.filename or dst.name)
+    if previous and previous != str(dst):
+        safe_previous = _safe_data_file(previous)
+        if safe_previous:
+            Path(safe_previous).unlink(missing_ok=True)
+    return {"ok": True, "name": file.filename or dst.name, "duration": meta.get("duration", 0), "volume": 0.16}
+
+
 # ---------- VIRAL CLIPS ----------
 @api.post("/projects/{pid}/viral_clips")
 async def viral_clips(pid: str):
-    """Ask LLM to find the 3-5 best viral-worthy short clip moments in this project."""
+    """Find and explain the strongest short-form moments using AI and local signals."""
     require_plan("pro")
     proj = await get_project(pid)
     transcript = proj.get("transcript") or {}
@@ -1385,7 +1532,12 @@ async def viral_clips(pid: str):
         raise HTTPException(400, "Project not analyzed yet")
     keys = await get_keys()
     duration = float(proj.get("duration", 0))
-    clips = await ai.extract_viral_clips(words, keys, duration)
+    analysis = proj.get("analysis") or {}
+    niche = analysis.get("quality_review", {}).get("profile") or proj.get("requested_profile") or "general"
+    audio_frames = await asyncio.to_thread(vp.analyze_audio_energy, proj["original_path"])
+    clips = await ai.extract_viral_clips(
+        words, keys, duration, audio_frames=audio_frames, niche=str(niche),
+    )
     await update_project(pid, viral_clips=clips)
     return {"clips": clips}
 
@@ -1414,7 +1566,12 @@ async def _run_render(pid: str, opts: RenderOptions):
         filler_indices = list(auto_fillers) if opts.remove_fillers else []
 
         # Compute keep segments (may be trimmed to viral clip window below)
-        keep = vp.build_keep_segments(words, filler_indices, duration)
+        keep = vp.build_keep_segments(
+            words,
+            filler_indices,
+            duration,
+            silence_threshold=opts.silence_threshold if opts.remove_silences else None,
+        )
 
         # If viral-clip mode: restrict keep to [clip_start, clip_end] range
         clip_start = opts.clip_start
@@ -1507,8 +1664,10 @@ async def _run_render(pid: str, opts: RenderOptions):
         else:
             output_path = str(DATA_DIR / "output" / f"{pid}_final.mp4")
 
+        bgm_path = proj.get("background_music_path") if opts.background_music else None
         await asyncio.to_thread(vp.render_final, cut_path, ass_path, sfx_events,
-                                broll_events, SFX_DIR, output_path)
+                                broll_events, SFX_DIR, output_path, bgm_path,
+                                opts.background_music_volume)
 
         # Never mark a broken or empty render as complete. This is the first
         # quality gate in the editing loop; later reference scoring can build
@@ -1555,12 +1714,21 @@ async def render(pid: str, opts: RenderOptions, bg: BackgroundTasks):
     proj = await get_project(pid)
     if not proj.get("transcript"):
         raise HTTPException(400, "Project not analyzed yet")
-    if proj.get("status") in ("queued_render", "rendering"):
+    active_statuses = {"queued", "extracting_audio", "transcribing", "analyzing", "queued_render", "rendering"}
+    if proj.get("status") in active_statuses:
         return {"ok": True, "status": proj["status"], "already_running": True}
     if opts.clip_end is not None and opts.clip_end > float(proj.get("duration") or 0) + 0.1:
         raise HTTPException(400, "Clip end exceeds the source duration")
-    await update_project(pid, status="queued_render",
-                         status_message="Render queued...", progress=1)
+    queued = await transition_project_status(
+        pid,
+        blocked_statuses=active_statuses,
+        status="queued_render",
+        status_message="Render queued...",
+        progress=1,
+    )
+    if not queued:
+        latest = await get_project(pid)
+        return {"ok": True, "status": latest.get("status"), "already_running": True}
     bg.add_task(_run_render, pid, opts)
     return {"ok": True, "status": "queued_render"}
 
@@ -1584,9 +1752,7 @@ async def download_final(pid: str, clip: Optional[str] = None):
     else:
         out = proj.get("output_path")
         fname = f"{base}_edited.mp4"
-    if not out or not os.path.exists(out):
-        raise HTTPException(404, "Output not ready")
-    return FileResponse(out, media_type="video/mp4", filename=fname)
+    return _safe_project_file(out, "video/mp4", fname)
 
 
 @api.get("/media/clip/{pid}/{clip_label}")
@@ -1595,27 +1761,21 @@ async def media_clip(pid: str, clip_label: str):
     proj = await get_project(pid)
     vr = proj.get("viral_renders") or {}
     out = vr.get(clip_label)
-    if not out or not os.path.exists(out):
-        raise HTTPException(404)
-    return FileResponse(out, media_type="video/mp4")
+    return _safe_project_file(out, "video/mp4")
 
 
 @api.get("/media/original/{pid}")
 async def media_original(pid: str):
     proj = await get_project(pid)
     p = proj.get("original_path")
-    if not p or not os.path.exists(p):
-        raise HTTPException(404)
-    return FileResponse(p, media_type=mimetypes.guess_type(p)[0] or "application/octet-stream")
+    return _safe_project_file(p, mimetypes.guess_type(p or "")[0] or "application/octet-stream")
 
 
 @api.get("/media/output/{pid}")
 async def media_output(pid: str):
     proj = await get_project(pid)
     p = proj.get("output_path")
-    if not p or not os.path.exists(p):
-        raise HTTPException(404)
-    return FileResponse(p, media_type="video/mp4")
+    return _safe_project_file(p, "video/mp4")
 
 
 # ---------- APP WIRING ----------

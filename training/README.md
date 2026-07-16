@@ -47,3 +47,7 @@ python -m pytest tests\test_editing_intelligence.py -o required_plugins= -o addo
 ```
 
 The fixture is synthetic and intentionally includes a good plan and an unsafe plan. Add new synthetic cases for talking-head, general gaming, and future profiles before changing scoring thresholds.
+
+## Editorial council v1
+
+`editorial_council_v1.json` is the reusable role rubric for the in-app editorial room. It encodes principles such as story before style, performance before continuity, rhythm without a universal cut-rate target, meaningful B-roll, sound as story, reviewable changes, and delivery QA. `backend/editorial_quality.py` scores only observable evidence against that rubric. It does not imitate named editors, infer private opinions, or treat a numeric score as a replacement for human approval.

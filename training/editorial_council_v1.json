@@ -1,0 +1,31 @@
+{
+  "schema_version": "klippd.editorial_council.v1",
+  "description": "Reusable editorial quality rubric distilled from public editor interviews and documented workflows. It guides review; it does not imitate or impersonate any editor.",
+  "principles": [
+    {"id": "story_before_style", "label": "Story before style", "test": "The hook, subject, and payoff are identifiable before decorative treatment."},
+    {"id": "performance_before_continuity", "label": "Performance before continuity", "test": "Filler removal and continuity cleanup must not flatten the strongest delivery."},
+    {"id": "rhythm_is_not_cut_count", "label": "Rhythm is not cut count", "test": "Pacing is evaluated against the selected profile and protects intentional pauses."},
+    {"id": "meaningful_broll", "label": "B-roll must add meaning", "test": "Every insert has a visible reason and rights/provenance state."},
+    {"id": "audience_clarity", "label": "Audience clarity", "test": "A first-time viewer can follow the intended promise without editor-only context."},
+    {"id": "reviewable_changes", "label": "Reviewable changes", "test": "Every automated change exposes evidence, timestamp, and an undo path."},
+    {"id": "sound_is_story", "label": "Sound is story", "test": "Dialogue, music, room tone, and effects are reviewed as a mix."},
+    {"id": "delivery_is_part_of_editing", "label": "Delivery is part of editing", "test": "Captions, safe zones, loudness, codec, and asset rights are checked before export."},
+    {"id": "fresh_eyes", "label": "Fresh eyes", "test": "The system can compare alternate drafts instead of forcing one template."},
+    {"id": "editor_ergonomics", "label": "Editor ergonomics", "test": "Markers, shortcuts, search, drafts, and recovery reduce cognitive load."}
+  ],
+  "roles": [
+    {"id": "story", "name": "Story Editor", "focus": ["hook", "promise", "payoff", "clarity"]},
+    {"id": "rhythm", "name": "Rhythm Editor", "focus": ["pacing", "silence", "music", "audience attention"]},
+    {"id": "performance", "name": "Performance Editor", "focus": ["best take", "delivery", "filler context", "natural pauses"]},
+    {"id": "visual", "name": "Visual Editor", "focus": ["B-roll meaning", "continuity", "emphasis", "rights"]},
+    {"id": "finishing", "name": "Finishing Editor", "focus": ["captions", "audio", "safe zones", "export QA"]}
+  ],
+  "anti_slop_rules": [
+    "Do not recommend a transition, zoom, SFX, or caption animation without a timestamped reason.",
+    "Do not claim quality from a virality score alone.",
+    "Do not use one universal cut-rate threshold for every niche or format.",
+    "Do not auto-remove pauses that carry emotion, humor, emphasis, or comprehension.",
+    "Do not call a project publish-ready when QA is missing or unevaluable.",
+    "Do not hide uncertainty; show the evidence and let the editor approve the change."
+  ]
+}

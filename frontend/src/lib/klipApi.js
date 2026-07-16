@@ -1,8 +1,23 @@
 import axios from "axios";
 
-// Production is served separately from the API. Keep an explicit fallback so a
-// missing build variable cannot send API requests to the static Vercel site.
-const BACKEND_URL = (process.env.REACT_APP_BACKEND_URL || "https://api.klippdstudio.com").replace(/\/$/, "");
+// Production is served separately from the API. Normalize the build variable so
+// both `https://api.example.com` and `https://api.example.com/api` work without
+// ever producing the broken `/api/api/...` URL.
+const DEFAULT_BACKEND_URL = process.env.NODE_ENV === "development"
+    ? "http://localhost:8000"
+    : "https://api.klippdstudio.com";
+const normalizeBackendUrl = (value) => {
+    const raw = String(value || DEFAULT_BACKEND_URL).trim().replace(/\/+$/, "");
+    try {
+        const url = new URL(raw);
+        url.pathname = url.pathname.replace(/\/+$/, "").replace(/\/api$/, "");
+        return url.toString().replace(/\/$/, "");
+    } catch {
+        return DEFAULT_BACKEND_URL;
+    }
+};
+
+const BACKEND_URL = normalizeBackendUrl(process.env.REACT_APP_BACKEND_URL);
 export const API = `${BACKEND_URL}/api`;
 
 const api = axios.create({ baseURL: API, timeout: 60000 });
@@ -159,7 +174,7 @@ export const brollSearch = (pid, query) =>
 export const getAssetPackStatus = (niche) =>
     api.get("/asset-packs/status", { params: { niche } }).then((r) => r.data);
 export const resolveAssetPack = (niche) =>
-    api.post("/asset-packs/resolve", { niche }, { params: { niche }, timeout: 0 }).then((r) => r.data);
+    api.post("/asset-packs/resolve", { niche }, { timeout: 0 }).then((r) => r.data);
 export const uploadCustomBroll = (pid, file, onProgress, rightsAttested = false) => {
     if (!rightsAttested) return Promise.reject(new Error("Asset rights confirmation is required"));
     const fd = new FormData();
@@ -183,10 +198,23 @@ export const renderProject = (id, opts) =>
     api.post(`/projects/${id}/render`, opts).then((r) => r.data);
 
 // Premium editing surfaces are intentionally kept behind their own API helpers.
-// Deployments that do not expose them yet return 404/501; the components hide
-// themselves without affecting the rest of the editor.
-export const isFeatureUnavailable = (error) =>
-    error?.response?.status === 404 || error?.response?.status === 501;
+// A 403 means the route exists but the workspace plan cannot use it yet. A
+// 404/501 means the backend build does not serve the feature.
+export const featureAccessState = (error) => {
+    const status = error?.response?.status;
+    if (status === 403) return "upgrade";
+    if (status === 404 || status === 501) return "unavailable";
+    return null;
+};
+export const uploadMusic = (pid, file, rightsAttested = false) => {
+    if (!rightsAttested) return Promise.reject(new Error("Music rights confirmation is required"));
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("rights_status", "user_owned_attested");
+    fd.append("rights_attestation", "I own or have commercial rights to this asset");
+    return api.post(`/projects/${pid}/music_upload`, fd, { timeout: 0 }).then((r) => r.data);
+};
+export const isFeatureUnavailable = (error) => Boolean(featureAccessState(error));
 
 export const getCreatorProfiles = () =>
     api.get("/creator-profiles").then((r) => r.data);
@@ -197,6 +225,20 @@ export const analyzeCreatorProfile = (payload) =>
 
 export const getEditChatHistory = (projectId) =>
     api.get(`/projects/${projectId}/edit-chat/history`).then((r) => r.data);
+export const getEditorialTeamReview = (projectId) =>
+    api.get(`/projects/${projectId}/editorial-team/review`).then((r) => r.data);
+export const getEditVersions = (projectId) =>
+    api.get(`/projects/${projectId}/edit-versions`).then((r) => r.data);
+export const saveEditVersion = (projectId, name) =>
+    api.post(`/projects/${projectId}/edit-versions`, { name }).then((r) => r.data);
+export const restoreEditVersion = (projectId, versionId) =>
+    api.post(`/projects/${projectId}/edit-versions/${versionId}/restore`).then((r) => r.data);
+export const getProjectMarkers = (projectId) =>
+    api.get(`/projects/${projectId}/markers`).then((r) => r.data);
+export const createProjectMarker = (projectId, payload) =>
+    api.post(`/projects/${projectId}/markers`, payload).then((r) => r.data);
+export const deleteProjectMarker = (projectId, markerId) =>
+    api.delete(`/projects/${projectId}/markers/${markerId}`).then((r) => r.data);
 export const previewEditChat = (projectId, payload) =>
     api.post(`/projects/${projectId}/edit-chat/preview`, payload, { timeout: 0 }).then((r) => r.data);
 export const applyEditChatPreview = (projectId, previewId) =>

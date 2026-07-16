@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
-import { BrainCircuit, CheckCircle2, ClipboardCheck, ExternalLink, Gamepad2, Plus, ShieldCheck } from "lucide-react";
+import { BrainCircuit, CheckCircle2, ClipboardCheck, ExternalLink, Gamepad2, Loader2, Plus, RefreshCw, ShieldCheck } from "lucide-react";
 import {
     activateTrainingProfile, apiErrorMessage, createTrainingProfile,
     createTrainingReference, getTrainingDashboard,
@@ -16,35 +16,41 @@ export default function TrainingLab() {
     const [reference, setReference] = useState(emptyReference);
     const [profile, setProfile] = useState(emptyProfile);
     const [selectedRefs, setSelectedRefs] = useState([]);
-    const [busy, setBusy] = useState(false);
+    const [busyAction, setBusyAction] = useState("");
+    const [loading, setLoading] = useState(true);
+    const [loadError, setLoadError] = useState("");
 
     const refresh = useCallback(async () => {
-        try { setData(await getTrainingDashboard()); }
-        catch (e) { toast.error(apiErrorMessage(e, "Could not load Training Lab")); }
+        try {
+            setLoadError("");
+            setData(await getTrainingDashboard());
+        }
+        catch (e) { setLoadError(apiErrorMessage(e, "Could not load Training Lab")); }
+        finally { setLoading(false); }
     }, []);
     useEffect(() => { refresh(); }, [refresh]);
 
     const addReference = async (event) => {
-        event.preventDefault(); setBusy(true);
+        event.preventDefault(); setBusyAction("reference");
         try {
             await createTrainingReference({ ...reference, principles: lines(reference.principles) });
             setReference(emptyReference); await refresh(); toast.success("Reference saved for review");
         } catch (e) { toast.error(apiErrorMessage(e, "Could not save reference")); }
-        finally { setBusy(false); }
+        finally { setBusyAction(""); }
     };
     const addProfile = async (event) => {
-        event.preventDefault(); setBusy(true);
+        event.preventDefault(); setBusyAction("profile");
         try {
             await createTrainingProfile({ ...profile, principles: lines(profile.principles), reference_ids: selectedRefs });
             setProfile(emptyProfile); setSelectedRefs([]); await refresh(); toast.success("Draft profile created");
         } catch (e) { toast.error(apiErrorMessage(e, "Could not create profile")); }
-        finally { setBusy(false); }
+        finally { setBusyAction(""); }
     };
     const activate = async (id) => {
-        setBusy(true);
+        setBusyAction(`activate-${id}`);
         try { await activateTrainingProfile(id); await refresh(); toast.success("Profile activated"); }
         catch (e) { toast.error(apiErrorMessage(e, "Could not activate profile")); }
-        finally { setBusy(false); }
+        finally { setBusyAction(""); }
     };
     const selectProfile = (id) => {
         try { window.localStorage.setItem("klipped_active_training_profile", id); }
@@ -52,6 +58,8 @@ export default function TrainingLab() {
         toast.success("This profile will be used for your next edit");
     };
     const field = (value, setter, key, props = {}) => <input value={value[key]} onChange={(e) => setter({ ...value, [key]: e.target.value })} className="w-full bg-black border border-white/15 px-3 py-2 text-sm outline-none focus:border-[#ccff00]" {...props} />;
+
+    const busy = Boolean(busyAction);
 
     return <main className="max-w-7xl mx-auto px-4 sm:px-6 py-8 pb-20">
         <section className="border border-[#ccff00]/50 bg-[#0a0a0a] p-6 sm:p-9 mb-8 relative overflow-hidden">
@@ -68,6 +76,21 @@ export default function TrainingLab() {
             </div>
         </section>
 
+        {loading && (
+            <div className="panel p-8 mb-6 flex items-center gap-3 text-white/60 font-mono text-sm" aria-busy="true">
+                <Loader2 className="w-4 h-4 animate-spin text-[#ccff00]" /> Loading Training Lab...
+            </div>
+        )}
+        {loadError && (
+            <div className="panel p-6 mb-6 border-[#ff5a5a]/40 bg-[#ff5a5a]/10" role="alert">
+                <div className="font-heading text-3xl tracking-wider">TRAINING DATA DID NOT LOAD</div>
+                <p className="mt-2 text-sm text-[#ffb3b3]">{loadError}</p>
+                <button className="btn-ghost mt-4" onClick={() => { setLoading(true); refresh(); }}>
+                    <RefreshCw className="w-4 h-4" /> Try again
+                </button>
+            </div>
+        )}
+
         <div className="grid lg:grid-cols-2 gap-6 items-start">
             <section className="panel p-5 sm:p-6">
                 <div className="flex gap-3 items-center mb-4"><Plus className="text-[#ccff00]" /><div><h2 className="font-display text-3xl">1. ADD A REFERENCE</h2><p className="text-white/45 text-xs">Save your observation, not someone else’s footage.</p></div></div>
@@ -80,7 +103,7 @@ export default function TrainingLab() {
                     </select>
                     <textarea value={reference.notes} onChange={(e) => setReference({ ...reference, notes: e.target.value })} required minLength="20" placeholder="What happens editorially? Example: the hook shows the final danger first, then quickly explains the challenge." className="w-full min-h-24 bg-black border border-white/15 px-3 py-2 text-sm outline-none focus:border-[#ccff00]" />
                     <textarea value={reference.principles} onChange={(e) => setReference({ ...reference, principles: e.target.value })} placeholder="Optional reusable rules, one per line" className="w-full min-h-20 bg-black border border-white/15 px-3 py-2 text-sm outline-none focus:border-[#ccff00]" />
-                    <button disabled={busy} className="btn-primary w-full"><ClipboardCheck className="w-4 h-4" /> SAVE REFERENCE</button>
+                    <button disabled={busy} className="btn-brand w-full justify-center">{busyAction === "reference" ? <Loader2 className="w-4 h-4 animate-spin" /> : <ClipboardCheck className="w-4 h-4" />} SAVE REFERENCE</button>
                 </form>
             </section>
 
@@ -95,13 +118,13 @@ export default function TrainingLab() {
                         {data.references.length ? data.references.map((ref) => <label className="flex gap-2 text-sm py-1 cursor-pointer" key={ref.id}><input type="checkbox" checked={selectedRefs.includes(ref.id)} onChange={() => setSelectedRefs((old) => old.includes(ref.id) ? old.filter((id) => id !== ref.id) : [...old, ref.id])} />{ref.title}</label>) : <span className="text-white/35 text-sm">Add a reference first, or write your own principles below.</span>}
                     </div>
                     <textarea value={profile.principles} onChange={(e) => setProfile({ ...profile, principles: e.target.value })} required placeholder="Approved editing principles, one per line&#10;Open on a real stake within the first 3 seconds.&#10;Show inventory or health changes as proof.&#10;Let the payoff breathe for at least one readable beat." className="w-full min-h-40 bg-black border border-white/15 px-3 py-2 text-sm outline-none focus:border-[#ccff00]" />
-                    <button disabled={busy} className="btn-primary w-full"><BrainCircuit className="w-4 h-4" /> CREATE DRAFT PROFILE</button>
+                    <button disabled={busy} className="btn-brand w-full justify-center">{busyAction === "profile" ? <Loader2 className="w-4 h-4 animate-spin" /> : <BrainCircuit className="w-4 h-4" />} CREATE DRAFT PROFILE</button>
                 </form>
             </section>
         </div>
 
         <section className="mt-6 panel p-5 sm:p-6"><div className="flex gap-3 items-center"><ShieldCheck className="text-[#ccff00]" /><div><h2 className="font-display text-3xl">3. ACTIVATE FOR EDITS</h2><p className="text-white/45 text-xs">Active profiles are available on the next upload.</p></div></div>
-            <div className="grid md:grid-cols-2 xl:grid-cols-3 gap-4 mt-5">{data.profiles.map((item) => <article className="border border-white/15 bg-black p-4" key={item.id}><div className="flex justify-between gap-3"><h3 className="font-display text-2xl">{item.name}</h3><span className={item.status === "active" ? "text-[#ccff00] font-mono text-[10px]" : "text-white/40 font-mono text-[10px]"}>{item.status.toUpperCase()}</span></div><p className="font-mono text-[10px] text-white/45 mt-1">{item.game || item.niche} · {item.reference_count || 0} refs · {item.principles.length} rules</p><ul className="text-sm text-white/65 mt-3 space-y-1">{item.principles.slice(0, 3).map((rule) => <li key={rule}>• {rule}</li>)}</ul><div className="flex gap-2 mt-4">{item.status !== "active" && <button disabled={busy} onClick={() => activate(item.id)} className="btn-ghost text-xs"><CheckCircle2 className="w-4 h-4" /> ACTIVATE</button>}{item.status === "active" && <button onClick={() => selectProfile(item.id)} className="btn-primary text-xs">USE NEXT EDIT</button>}</div></article>)}</div>
+            <div className="grid md:grid-cols-2 xl:grid-cols-3 gap-4 mt-5">{data.profiles.map((item) => <article className="border border-white/15 bg-black p-4" key={item.id}><div className="flex justify-between gap-3"><h3 className="font-display text-2xl">{item.name}</h3><span className={item.status === "active" ? "text-[#ccff00] font-mono text-[10px]" : "text-white/40 font-mono text-[10px]"}>{item.status.toUpperCase()}</span></div><p className="font-mono text-[10px] text-white/45 mt-1">{item.game || item.niche} · {item.reference_count || 0} refs · {item.principles.length} rules</p><ul className="text-sm text-white/65 mt-3 space-y-1">{item.principles.slice(0, 3).map((rule) => <li key={rule}>• {rule}</li>)}</ul><div className="flex gap-2 mt-4">{item.status !== "active" && <button disabled={busy} onClick={() => activate(item.id)} className="btn-ghost text-xs" data-testid={`activate-profile-${item.id}`}><CheckCircle2 className="w-4 h-4" /> ACTIVATE</button>}{item.status === "active" && <button onClick={() => selectProfile(item.id)} className="btn-brand text-xs" data-testid={`use-profile-${item.id}`}>USE NEXT EDIT</button>}</div></article>)}</div>
             {!data.profiles.length && <p className="text-white/40 mt-4">No profiles yet. Build the first one around Minecraft narrative edits.</p>}
         </section>
         <p className="mt-6 text-xs text-white/35 flex gap-2"><ExternalLink className="w-3.5 h-3.5 flex-none" />{data.policy}</p>

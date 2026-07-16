@@ -10,6 +10,7 @@ import subprocess
 import json
 import logging
 import shlex
+import re
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,22 @@ def probe_video(path: str) -> Dict[str, Any]:
     }
 
 
+def probe_audio(path: str) -> Dict[str, Any]:
+    """Probe an uploaded music bed without requiring a video stream."""
+    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", path]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    data = json.loads(proc.stdout)
+    audio = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
+    if not audio:
+        raise RuntimeError("No audio stream found")
+    return {
+        "duration": float(data.get("format", {}).get("duration", 0)),
+        "channels": int(audio.get("channels", 0)),
+        "sample_rate": int(audio.get("sample_rate", 0) or 0),
+        "size": int(data.get("format", {}).get("size", 0)),
+    }
+
+
 def _parse_fps(rate: str) -> float:
     try:
         num, den = rate.split("/")
@@ -58,6 +75,46 @@ def extract_audio(input_path: str, output_path: str) -> None:
         output_path,
     ]
     run_ff(cmd)
+
+
+def analyze_audio_energy(input_path: str, frame_seconds: float = 0.5) -> List[Dict[str, float]]:
+    """Sample RMS and peak levels without loading the source audio into memory."""
+    sample_count = max(800, int(16000 * frame_seconds))
+    cmd = [
+        "ffmpeg", "-hide_banner", "-nostats", "-i", input_path, "-vn", "-ac", "1", "-ar", "16000",
+        "-af", f"aresample=16000,asetnsamples=n={sample_count}:p=0,astats=metadata=1:reset=1,ametadata=mode=print:file=-",
+        "-f", "null", "-",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("Audio signal sampling unavailable: %s", exc)
+        return []
+    if proc.returncode != 0:
+        logger.warning("Audio signal sampling failed: %s", proc.stderr[-500:])
+        return []
+
+    frames = []
+    current: Dict[str, float] = {}
+    for line in proc.stdout.splitlines():
+        time_match = re.search(r"pts_time:([0-9.]+)", line)
+        if time_match:
+            if "time" in current and "rms_db" in current:
+                frames.append(current)
+            current = {"time": float(time_match.group(1))}
+            continue
+        rms_match = re.search(r"lavfi\.astats\.Overall\.RMS_level=(-?(?:inf|[0-9.]+))", line, re.I)
+        if rms_match:
+            value = rms_match.group(1).lower()
+            current["rms_db"] = float("-inf") if value == "-inf" else float(value)
+            continue
+        peak_match = re.search(r"lavfi\.astats\.Overall\.Peak_level=(-?(?:inf|[0-9.]+))", line, re.I)
+        if peak_match:
+            value = peak_match.group(1).lower()
+            current["peak_db"] = float("-inf") if value == "-inf" else float(value)
+    if "time" in current and "rms_db" in current:
+        frames.append(current)
+    return frames
 
 
 def compress_upload(input_path: str, output_path: str, max_width: int = 1920,
@@ -79,7 +136,8 @@ def compress_upload(input_path: str, output_path: str, max_width: int = 1920,
 
 # ---------- FILLER SEGMENT MERGING ----------
 def build_keep_segments(words: List[Dict], filler_indices: List[int],
-                        duration: float, pad: float = 0.03) -> List[Dict]:
+                        duration: float, pad: float = 0.03,
+                        silence_threshold: float | None = None) -> List[Dict]:
     if not words:
         return [{"start": 0, "end": duration}]
     fillers = set(filler_indices or [])
@@ -90,6 +148,21 @@ def build_keep_segments(words: List[Dict], filler_indices: List[int],
             e = float(w.get("end", 0)) + pad
             if e > s:
                 remove.append((s, e))
+    # Optional dead-air cleanup. Keep a small breath between phrases, while
+    # removing only transcript-grounded gaps above the user's threshold.
+    if silence_threshold is not None and silence_threshold > 0 and len(words) > 1:
+        ordered = sorted(
+            (w for w in words if isinstance(w, dict)),
+            key=lambda item: float(item.get("start", 0) or 0),
+        )
+        for previous, current in zip(ordered, ordered[1:]):
+            previous_end = float(previous.get("end", 0) or 0)
+            current_start = float(current.get("start", 0) or 0)
+            if current_start - previous_end >= silence_threshold:
+                gap_start = previous_end + pad
+                gap_end = current_start - pad
+                if gap_end > gap_start:
+                    remove.append((gap_start, gap_end))
     remove.sort()
     merged = []
     for s, e in remove:
@@ -174,7 +247,7 @@ def generate_ass(words: List[Dict], out_path: str, style: str,
         margin_v = int(res_h * 0.20)
         alignment = 2
         bold = -1
-    elif style == "luxury":
+    elif style in {"luxury", "editorial"}:
         # Editorial white captions with restrained gold keyword emphasis.
         # DejaVu Serif ships with the production Linux image, unlike most
         # commercial display fonts, so this treatment renders consistently.
@@ -184,7 +257,20 @@ def generate_ass(words: List[Dict], out_path: str, style: str,
         outline = "&H00101010"
         emphasis_color = "&H0037AFD4"  # #D4AF37 gold in ASS BGR
         outline_w = 2
-        margin_v = int(res_h * 0.16)
+        margin_v = int(res_h * (0.16 if style == "luxury" else 0.12))
+        alignment = 2
+        bold = -1
+    elif style == "marketing":
+        # High-contrast, brand-safe treatment for marketing explainers:
+        # compact sans captions, yellow emphasis, and a slightly higher card
+        # position so product/UI overlays have room below.
+        font = "Arial"
+        size = int(res_h * 0.050)
+        primary = "&H00FFFFFF"
+        outline = "&H00141414"
+        emphasis_color = "&H0000D9FF"  # vivid yellow in ASS BGR
+        outline_w = 3
+        margin_v = int(res_h * 0.18)
         alignment = 2
         bold = -1
     else:  # youtube clean
@@ -227,7 +313,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             offset += (e - s)
         return None
 
-    lines = [header]
+    # Word-level timing is useful for karaoke highlighting, but one dialogue
+    # event per word becomes unreadable on normal speech. Group nearby words
+    # into short, legible cards while preserving emphasis when any word in the
+    # card is emphasized.
+    caption_groups = []
+    current = []
     for i, w in enumerate(words):
         txt = _sanitize(w.get("word", ""))
         if not txt:
@@ -238,17 +329,60 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         re_ = _remap(end)
         if rs is None or re_ is None or re_ <= rs:
             continue
-        if re_ - rs < 0.12:
-            re_ = rs + 0.12
-        style_name = "Emph" if i in emphasis_set else "Default"
+        item = {"index": i, "text": txt, "start": rs, "end": max(re_, rs + 0.12)}
+        if current:
+            gap = item["start"] - current[-1]["end"]
+            span = item["end"] - current[0]["start"]
+            if gap > 0.24 or len(current) >= 3 or span > 1.35:
+                caption_groups.append(current)
+                current = []
+        current.append(item)
+    if current:
+        caption_groups.append(current)
+
+    # Avoid flash captions caused by a short final word or a brief pause. A
+    # readable card needs roughly half a second; merge tiny adjacent cards
+    # where possible, then extend isolated cards only into their available
+    # gap so captions never overlap.
+    merged_groups = []
+    for group in caption_groups:
+        duration = group[-1]["end"] - group[0]["start"]
+        if merged_groups and duration < 0.5:
+            previous = merged_groups[-1]
+            gap = group[0]["start"] - previous[-1]["end"]
+            if gap <= 0.4 and len(previous) + len(group) <= 6:
+                previous.extend(group)
+                continue
+        merged_groups.append(group)
+    for i in range(len(merged_groups) - 2, -1, -1):
+        group = merged_groups[i]
+        duration = group[-1]["end"] - group[0]["start"]
+        following = merged_groups[i + 1]
+        gap = following[0]["start"] - group[-1]["end"]
+        if duration < 0.5 and gap <= 0.4 and len(group) + len(following) <= 6:
+            group.extend(following)
+            del merged_groups[i + 1]
+    caption_groups = merged_groups
+
+    lines = [header]
+    for group_index, group in enumerate(caption_groups):
+        txt = " ".join(item["text"] for item in group)
+        rs = group[0]["start"]
+        re_ = group[-1]["end"]
+        if re_ - rs < 0.5:
+            next_start = caption_groups[group_index + 1][0]["start"] if group_index + 1 < len(caption_groups) else None
+            re_ = min(rs + 0.5, next_start - 0.03) if next_start is not None else rs + 0.5
+            if re_ <= rs:
+                re_ = group[-1]["end"]
+        emphasized = any(item["index"] in emphasis_set for item in group)
+        style_name = "Emph" if emphasized else "Default"
         if style == "luxury":
-            # Short upward slide, then settle. Emphasized keywords land larger.
             y = int(res_h * 0.84)
-            start_scale = 128 if i in emphasis_set else 112
+            start_scale = 128 if emphasized else 112
             effect = rf"{{\an2\move({res_w // 2},{y + 42},{res_w // 2},{y},0,180)\fad(50,90)\fscx{start_scale}\fscy{start_scale}\t(0,180,\fscx100\fscy100)}}"
         else:
             effect = r"{\fad(60,60)\t(0,80,\fscx115\fscy115)\t(80,160,\fscx100\fscy100)}"
-            if i in emphasis_set:
+            if emphasized:
                 effect = r"{\fad(40,60)\t(0,100,\fscx140\fscy140)\t(100,220,\fscx110\fscy110)}"
         lines.append(f"Dialogue: 0,{_fmt_time(rs)},{_fmt_time(re_)},{style_name},,0,0,0,,{effect}{txt}")
 
@@ -309,7 +443,8 @@ def cut_and_concat(input_path: str, keep_segments: List[Dict], output_path: str,
 
 # ---------- FULL RENDER ----------
 def render_final(cut_video: str, ass_file: Optional[str], sfx_events: List[float],
-                 broll_events: List[Dict], sfx_dir: str, output_path: str) -> None:
+                 broll_events: List[Dict], sfx_dir: str, output_path: str,
+                 bgm_path: Optional[str] = None, bgm_volume: float = 0.16) -> None:
     base_meta = probe_video(cut_video)
     canvas_w = max(2, int(base_meta.get("width") or 1920))
     canvas_h = max(2, int(base_meta.get("height") or 1080))
@@ -337,6 +472,12 @@ def render_final(cut_video: str, ass_file: Optional[str], sfx_events: List[float
     if has_whoosh:
         inputs += ["-i", whoosh_path]
         whoosh_idx = input_idx
+        input_idx += 1
+
+    bgm_idx = None
+    if bgm_path and os.path.exists(bgm_path):
+        inputs += ["-stream_loop", "-1", "-i", bgm_path]
+        bgm_idx = input_idx
         input_idx += 1
 
     filters = []
@@ -392,6 +533,19 @@ def render_final(cut_video: str, ass_file: Optional[str], sfx_events: List[float
         # Passthrough audio via anull so filter output label exists
         filters.append("[0:a]anull[aout]")
         audio_cur = "[aout]"
+
+    if bgm_idx is not None:
+        # Keep the music present, but automatically duck it under the spoken
+        # track. The small volume default mirrors the reference mixes.
+        filters.append(f"[{bgm_idx}:a]volume={max(0.0, min(0.5, float(bgm_volume)))}[bgm0]")
+        filters.append(f"[bgm0][0:a]sidechaincompress=threshold=0.035:ratio=8:attack=20:release=260[bgmduck]")
+        filters.append(f"{audio_cur}[bgmduck]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[bgm_mix]")
+        audio_cur = "[bgm_mix]"
+
+    # Match the reference pack's finished-ad loudness while preserving headroom
+    # for mobile playback and short-form platform normalization.
+    filters.append(f"{audio_cur}loudnorm=I=-14:TP=-1.5:LRA=7:linear=false[final_audio]")
+    audio_cur = "[final_audio]"
 
     filter_complex = ";".join(filters) if filters else None
 

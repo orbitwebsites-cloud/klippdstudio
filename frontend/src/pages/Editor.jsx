@@ -8,6 +8,8 @@ import {
     Scissors,
     Wand2,
     Volume2,
+    AudioLines,
+    Music,
     Film,
     Zap,
     RefreshCw,
@@ -24,6 +26,8 @@ import {
 import LibraryPanel from "@/components/LibraryPanel";
 import CreatorProfilesPanel from "@/components/CreatorProfilesPanel";
 import EditChatPanel from "@/components/EditChatPanel";
+import EditorialTeamPanel from "@/components/EditorialTeamPanel";
+import EditorTimeline from "@/components/EditorTimeline";
 import {
     API,
     getProject,
@@ -38,6 +42,7 @@ import {
     downloadUrl,
     apiErrorMessage,
     saveEditOptions,
+    uploadMusic,
 } from "@/lib/klipApi";
 
 const STATUS_LABELS = {
@@ -67,7 +72,7 @@ export default function Editor() {
     const [style, setStyle] = useState("tiktok");
     const [aspect, setAspect] = useState("16:9");
     const [renderOpts, setRenderOpts] = useState({
-        remove_fillers: true, captions: true, sfx: true, zoom_ins: true, broll: true,
+        remove_fillers: true, remove_silences: false, silence_threshold: 0.8, captions: true, sfx: true, zoom_ins: true, broll: true, background_music: false, background_music_volume: 0.16,
     });
     const [excludedFillers, setExcludedFillers] = useState(new Set());
     const [addedFillers, setAddedFillers] = useState(new Set());
@@ -81,10 +86,16 @@ export default function Editor() {
     const [extractingClips, setExtractingClips] = useState(false);
     const [renderingClipLabel, setRenderingClipLabel] = useState(null);
     const [currentTime, setCurrentTime] = useState(0);
+    const [rangeStart, setRangeStart] = useState("");
+    const [rangeEnd, setRangeEnd] = useState("");
     const [libraryPick, setLibraryPick] = useState(null);
+    const [libraryTargetMoment, setLibraryTargetMoment] = useState("");
     const [creatorProfileId, setCreatorProfileId] = useState(null);
     const [draftLoadedFor, setDraftLoadedFor] = useState(null);
     const [showSettingsCue, setShowSettingsCue] = useState(false);
+    const [musicUploading, setMusicUploading] = useState(false);
+    const [musicName, setMusicName] = useState("");
+    const [teamPrompt, setTeamPrompt] = useState("");
     const videoRef = useRef();
     const transcriptRef = useRef();
     const brollFileInputRef = useRef();
@@ -154,11 +165,12 @@ export default function Editor() {
         setRenderOpts((current) => ({
             ...current,
             ...Object.fromEntries(
-                ["remove_fillers", "captions", "sfx", "zoom_ins", "broll"]
+                ["remove_fillers", "remove_silences", "captions", "sfx", "zoom_ins", "broll", "background_music"]
                     .filter((key) => typeof options[key] === "boolean")
                     .map((key) => [key, options[key]])
             ),
         }));
+        if (Number.isFinite(options.silence_threshold)) setRenderOpts((current) => ({ ...current, silence_threshold: Number(options.silence_threshold) }));
         if (Array.isArray(options.selected_broll)) {
             setBrollSelected(Object.fromEntries(
                 options.selected_broll
@@ -177,11 +189,12 @@ export default function Editor() {
         setRenderOpts((current) => ({
             ...current,
             ...Object.fromEntries(
-                ["remove_fillers", "captions", "sfx", "zoom_ins", "broll"]
+                ["remove_fillers", "remove_silences", "captions", "sfx", "zoom_ins", "broll", "background_music"]
                     .filter((key) => typeof saved[key] === "boolean")
                     .map((key) => [key, saved[key]])
             ),
         }));
+        if (Number.isFinite(saved.silence_threshold)) setRenderOpts((current) => ({ ...current, silence_threshold: Number(saved.silence_threshold) }));
         setDraftLoadedFor(project.id);
     }, [project, draftLoadedFor]);
 
@@ -210,6 +223,23 @@ export default function Editor() {
         return s;
     }, [autoFillers, excludedFillers, addedFillers]);
 
+    const [transcriptQuery, setTranscriptQuery] = useState("");
+    const transcriptMatches = useMemo(() => {
+        const query = transcriptQuery.trim().toLowerCase();
+        if (!query) return [];
+        return words.reduce((matches, word, index) => {
+            if (String(word.word || "").toLowerCase().includes(query)) matches.push(index);
+            return matches;
+        }, []);
+    }, [transcriptQuery, words]);
+
+    const cutTranscriptMatches = () => {
+        if (!transcriptMatches.length) return;
+        setAddedFillers((current) => new Set([...current, ...transcriptMatches]));
+        setExcludedFillers((current) => new Set([...current].filter((index) => !transcriptMatches.includes(index))));
+        toast.success(`Marked ${transcriptMatches.length} matching word${transcriptMatches.length === 1 ? "" : "s"} for cut`);
+    };
+
     const activeIdx = useMemo(() => {
         if (!words.length) return -1;
         for (let i = 0; i < words.length; i++) {
@@ -218,6 +248,57 @@ export default function Editor() {
         }
         return -1;
     }, [words, currentTime]);
+
+    const mediaDuration = Number(project.duration || videoRef.current?.duration || 0);
+    const currentTimeRef = useRef(currentTime);
+    const rangeEndRef = useRef(rangeEnd);
+    const mediaDurationRef = useRef(mediaDuration);
+    currentTimeRef.current = currentTime;
+    rangeEndRef.current = rangeEnd;
+    mediaDurationRef.current = mediaDuration;
+    const normalizedRange = useMemo(() => {
+        const start = Number(rangeStart);
+        const end = Number(rangeEnd);
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start) return null;
+        if (mediaDuration > 0 && end > mediaDuration) return null;
+        return { start, end };
+    }, [rangeStart, rangeEnd, mediaDuration]);
+
+    const setRangePoint = useCallback((point) => {
+        const value = Math.max(0, Number(Number(currentTimeRef.current).toFixed(2)));
+        if (point === "start") {
+            setRangeStart(String(value));
+            if (rangeEndRef.current && Number(rangeEndRef.current) <= value) setRangeEnd("");
+        } else {
+            setRangeEnd(String(value));
+        }
+    }, []);
+
+    useEffect(() => {
+        const onKeyDown = (event) => {
+            const tag = event.target?.tagName?.toLowerCase();
+            if (tag === "input" || tag === "textarea" || tag === "select" || event.target?.isContentEditable) return;
+            if (event.key === " ") {
+                event.preventDefault();
+                if (videoRef.current?.paused) videoRef.current.play();
+                else videoRef.current?.pause();
+            } else if (event.key === "ArrowLeft") {
+                event.preventDefault();
+                if (videoRef.current) videoRef.current.currentTime = Math.max(0, videoRef.current.currentTime - (event.shiftKey ? 1 : 0.1));
+            } else if (event.key === "ArrowRight") {
+                event.preventDefault();
+                if (videoRef.current) videoRef.current.currentTime = Math.min(mediaDurationRef.current || Infinity, videoRef.current.currentTime + (event.shiftKey ? 1 : 0.1));
+            } else if (event.key.toLowerCase() === "i") {
+                event.preventDefault();
+                setRangePoint("start");
+            } else if (event.key.toLowerCase() === "o") {
+                event.preventDefault();
+                setRangePoint("end");
+            }
+        };
+        window.addEventListener("keydown", onKeyDown);
+        return () => window.removeEventListener("keydown", onKeyDown);
+    }, [setRangePoint]);
 
     useEffect(() => {
         if (activeIdx < 0) return;
@@ -350,6 +431,7 @@ export default function Editor() {
             excluded_filler_indices: [...excludedFillers],
             added_filler_indices: [...addedFillers],
             selected_broll,
+            ...(normalizedRange ? { clip_start: normalizedRange.start, clip_end: normalizedRange.end, clip_label: `range_${Math.round(normalizedRange.start)}_${Math.round(normalizedRange.end)}s` } : {}),
         };
         try {
             await renderProject(id, opts);
@@ -379,6 +461,21 @@ export default function Editor() {
         setShowSettingsCue(false);
         try { window.sessionStorage.removeItem(`klippd_settings_cue_${id}`); }
         catch { /* The cue is non-essential. */ }
+    };
+
+    const addMusic = async (file) => {
+        if (!file) return;
+        const rightsAttested = window.confirm("Confirm that you own this track or have commercial rights to use it in exported videos.");
+        if (!rightsAttested) return;
+        setMusicUploading(true);
+        try {
+            const result = await uploadMusic(id, file, rightsAttested);
+            setMusicName(result.name || file.name);
+            setRenderOpts((current) => ({ ...current, background_music: true }));
+            toast.success("Music bed attached and ducking enabled");
+        } catch (error) {
+            toast.error(apiErrorMessage(error, "Music upload failed"));
+        } finally { setMusicUploading(false); }
     };
 
     const shouldShowSettingsCue = isReady && showSettingsCue;
@@ -413,7 +510,7 @@ export default function Editor() {
                             <div className="text-white/60 text-sm mt-2">{project.status_message}</div>
                             <div className="h-1 bg-white/10 mt-4">
                                 <div
-                                    className="h-1 bg-[#ccff00] transition-all"
+                                    className="h-1 bg-[#ccff00] transition-[width] duration-200"
                                     style={{ width: `${project.progress || 0}%` }}
                                 />
                             </div>
@@ -461,6 +558,31 @@ export default function Editor() {
                             onTimeUpdate={(e) => setCurrentTime(e.target.currentTime)}
                             data-testid="video-player"
                         />
+                        <div className="border-t border-white/10 p-4 space-y-3" data-testid="range-editor">
+                            <div className="flex flex-wrap items-center justify-between gap-3">
+                                <div>
+                                    <div className="font-mono text-xs tracking-widest text-white/55">// RANGE EDIT</div>
+                                    <div className="mt-1 text-xs text-white/40">Set an in/out range for a focused export. Space plays; ←/→ steps; I/O set points.</div>
+                                </div>
+                                <button type="button" className="btn-ghost !px-3 !py-2 text-xs" onClick={() => { setRangeStart(""); setRangeEnd(""); }} disabled={!rangeStart && !rangeEnd} data-testid="clear-range">
+                                    Clear range
+                                </button>
+                            </div>
+                            <div className="grid grid-cols-2 sm:grid-cols-[1fr_auto_1fr_auto] gap-2 items-end">
+                                <label className="font-mono text-[10px] uppercase text-white/45">
+                                    In point (s)
+                                    <input type="number" min="0" step="0.01" value={rangeStart} onChange={(event) => setRangeStart(event.target.value)} className="mt-1 w-full bg-black border border-white/15 px-3 py-2 text-sm text-white outline-none focus:border-[#ccff00]" placeholder="0.00" data-testid="range-start" />
+                                </label>
+                                <button type="button" className="btn-ghost !px-3 !py-2 text-xs" onClick={() => setRangePoint("start")} data-testid="set-range-start">Set at playhead</button>
+                                <label className="font-mono text-[10px] uppercase text-white/45">
+                                    Out point (s)
+                                    <input type="number" min="0" step="0.01" value={rangeEnd} onChange={(event) => setRangeEnd(event.target.value)} className="mt-1 w-full bg-black border border-white/15 px-3 py-2 text-sm text-white outline-none focus:border-[#ccff00]" placeholder={mediaDuration ? mediaDuration.toFixed(2) : "0.00"} data-testid="range-end" />
+                                </label>
+                                <button type="button" className="btn-ghost !px-3 !py-2 text-xs" onClick={() => setRangePoint("end")} data-testid="set-range-end">Set at playhead</button>
+                            </div>
+                            {(rangeStart || rangeEnd) && !normalizedRange && <div className="text-xs text-[#ff9b9b]" role="alert">Choose an out point after the in point{mediaDuration ? ` and keep it within ${mediaDuration.toFixed(2)} seconds` : ""}.</div>}
+                            {normalizedRange && <div className="text-xs text-[#ccff00]">Focused export: {normalizedRange.start.toFixed(2)}s–{normalizedRange.end.toFixed(2)}s ({(normalizedRange.end - normalizedRange.start).toFixed(2)}s)</div>}
+                        </div>
                         {hasMainOutput && (
                             <div className="p-4 flex items-center justify-between border-t border-white/10">
                                 <div className="font-mono text-xs text-[#ccff00] tracking-widest">
@@ -478,17 +600,38 @@ export default function Editor() {
                         )}
                     </div>
 
+                    <EditorTimeline
+                        project={project}
+                        currentTime={currentTime}
+                        onSeek={(time) => {
+                            if (videoRef.current) videoRef.current.currentTime = time;
+                            setCurrentTime(time);
+                        }}
+                    />
+
+                    {isReady && (
+                        <EditorialTeamPanel
+                            projectId={id}
+                            onUsePrompt={(prompt) => {
+                                setTeamPrompt(prompt);
+                                document.querySelector('[data-testid="edit-chat-panel"]')?.scrollIntoView({ behavior: "smooth", block: "start" });
+                            }}
+                        />
+                    )}
+
                     {isReady && (
                         <EditChatPanel
                             projectId={id}
                             creatorProfileId={creatorProfileId}
                             onApplied={refresh}
+                            suggestedPrompt={teamPrompt}
                         />
                     )}
 
                     {isReady && words.length > 0 && (
                         <div className="panel">
-                            <div className="px-6 py-4 border-b border-white/10 flex items-center justify-between">
+                            <div className="px-6 py-4 border-b border-white/10 flex flex-col gap-3">
+                                <div className="flex items-center justify-between">
                                 <div>
                                     <div className="font-display text-xl tracking-wider">TRANSCRIPT</div>
                                     <div className="font-mono text-[10px] text-white/40 tracking-widest">
@@ -498,6 +641,17 @@ export default function Editor() {
                                 <div className="font-mono text-xs text-white/50">
                                     {Math.round(currentTime)}s
                                 </div>
+                                </div>
+                                <div className="flex flex-col sm:flex-row gap-2">
+                                    <label className="relative flex-1">
+                                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-white/35" aria-hidden="true" />
+                                        <input value={transcriptQuery} onChange={(event) => setTranscriptQuery(event.target.value)} className="w-full bg-black border border-white/15 pl-9 pr-3 py-2 text-sm text-white outline-none focus:border-[#ccff00]" placeholder="Search transcript to find a word or phrase" aria-label="Search transcript" />
+                                    </label>
+                                    <button type="button" className="btn-ghost !px-3 !py-2 text-xs" onClick={cutTranscriptMatches} disabled={!transcriptMatches.length}>
+                                        <Scissors className="w-3 h-3" /> Cut {transcriptMatches.length || "matches"}
+                                    </button>
+                                </div>
+                                {transcriptQuery && <div className="font-mono text-[10px] text-white/40">{transcriptMatches.length} match{transcriptMatches.length === 1 ? "" : "es"} · click a word to toggle it · double-click to preview from that moment</div>}
                             </div>
                             <div
                                 ref={transcriptRef}
@@ -513,16 +667,19 @@ export default function Editor() {
                                     if (isEmph && !isFiller) cls += "word-emphasis ";
                                     if (isActive) cls += "word-active ";
                                     return (
-                                        <span
+                                        <button
+                                            type="button"
                                             key={i}
                                             id={`w-${i}`}
-                                            className={cls}
+                                            className={`${cls} inline bg-transparent border-0 p-0 text-left`}
                                             onClick={() => toggleFiller(i)}
                                             onDoubleClick={() => jumpTo(i)}
+                                            aria-pressed={isFiller}
+                                            aria-label={`${isFiller ? "Keep" : "Cut"} word ${w.word} at ${Number(w.start || 0).toFixed(1)} seconds. Double click to jump.`}
                                             title={`${w.start?.toFixed(2)}s · click to toggle cut · dbl-click to jump`}
                                         >
                                             {w.word}{" "}
-                                        </span>
+                                        </button>
                                     );
                                 })}
                             </div>
@@ -588,13 +745,31 @@ export default function Editor() {
                             >
                                 LUXURY
                             </button>
+                            <button
+                                className={`style-pill ${style === "marketing" ? "active-marketing" : ""}`}
+                                onClick={() => setStyle("marketing")}
+                                data-testid="style-marketing"
+                            >
+                                MARKETING
+                            </button>
+                            <button
+                                className={`style-pill ${style === "editorial" ? "active-editorial" : ""}`}
+                                onClick={() => setStyle("editorial")}
+                                data-testid="style-editorial"
+                            >
+                                EDITORIAL
+                            </button>
                         </div>
                         <div className="text-xs text-white/50 mt-3">
                             {style === "tiktok"
-                                ? "Bold Impact font. Pink emphasis. Bounce animations. Aggressive."
+                                ? "High-contrast captions with one deliberate emphasis color. Fast, legible, and built for vertical viewing."
+                                : style === "marketing"
+                                ? "Bright, structured captions for hooks, proof, and CTAs. Built for product, education, and growth content."
+                                : style === "editorial"
+                                ? "Clean serif-led captions with restrained emphasis for premium explainers, real estate, and thoughtful storytelling."
                                 : style === "luxury"
                                 ? "Editorial white captions. Gold keywords. Smooth slide-in motion."
-                                : "Clean Arial. Yellow emphasis. Subtle. Studio-look."}
+                                : "Clean sans-serif captions. Yellow emphasis. Subtle motion for a studio look."}
                         </div>
                     </div>
 
@@ -608,6 +783,21 @@ export default function Editor() {
                             onChange={(v) => setRenderOpts((o) => ({ ...o, remove_fillers: v }))}
                             testid="toggle-fillers"
                         />
+                        <Toggle
+                            icon={AudioLines}
+                            label="Trim dead air"
+                            sub={renderOpts.remove_silences ? `Cuts pauses over ${renderOpts.silence_threshold.toFixed(1)}s` : "Keep natural pauses"}
+                            checked={renderOpts.remove_silences}
+                            onChange={(v) => setRenderOpts((o) => ({ ...o, remove_silences: v }))}
+                            testid="toggle-silences"
+                        />
+                        {renderOpts.remove_silences && (
+                            <label className="block pl-14 -mt-2 text-[10px] font-mono text-white/45">
+                                PAUSE THRESHOLD
+                                <input type="range" min="0.3" max="2.0" step="0.1" value={renderOpts.silence_threshold} onChange={(event) => setRenderOpts((o) => ({ ...o, silence_threshold: Number(event.target.value) }))} className="w-full accent-[#ccff00] mt-2" aria-label="Pause threshold" />
+                                <span className="text-[#ccff00]">{renderOpts.silence_threshold.toFixed(1)}s</span>
+                            </label>
+                        )}
                         <Toggle
                             icon={Wand2}
                             label="Animated captions"
@@ -632,6 +822,26 @@ export default function Editor() {
                             onChange={(v) => setRenderOpts((o) => ({ ...o, sfx: v }))}
                             testid="toggle-sfx"
                         />
+                        <div className="border-t border-white/10 pt-4">
+                            <div className="flex items-center gap-3">
+                                <Music className={`w-4 h-4 ${renderOpts.background_music ? "text-[#ccff00]" : "text-white/40"}`} />
+                                <div className="flex-1 min-w-0">
+                                    <div className="text-sm font-semibold text-white">Background music</div>
+                                    <div className="text-[10px] font-mono text-white/40 truncate">{musicName || "Attach a licensed music bed"}</div>
+                                </div>
+                                <label className="btn-ghost !px-2 !py-1.5 text-[10px] cursor-pointer">
+                                    {musicUploading ? <Loader2 className="w-3 h-3 animate-spin" /> : "Upload"}
+                                    <input type="file" accept="audio/*" className="hidden" disabled={musicUploading} onChange={(event) => { addMusic(event.target.files?.[0]); event.target.value = ""; }} />
+                                </label>
+                            </div>
+                            {musicName && <div className="pl-7 mt-3 space-y-2">
+                                <label className="block text-[10px] font-mono text-white/45">MUSIC LEVEL <input type="range" min="0" max="0.35" step="0.01" value={renderOpts.background_music_volume} onChange={(event) => setRenderOpts((o) => ({ ...o, background_music_volume: Number(event.target.value) }))} className="w-full accent-[#ccff00] mt-2" aria-label="Background music level" /><span className="text-[#ccff00]">{Math.round(renderOpts.background_music_volume * 100)}%</span></label>
+                                <div className="flex gap-2">
+                                    <button type="button" className="btn-ghost !px-2 !py-1.5 text-[10px]" onClick={() => setRenderOpts((current) => ({ ...current, background_music: !current.background_music }))} data-testid="toggle-background-music">{renderOpts.background_music ? "Disable music" : "Enable music"}</button>
+                                    <button type="button" className="btn-ghost !px-2 !py-1.5 text-[10px]" onClick={() => { setMusicName(""); setRenderOpts((current) => ({ ...current, background_music: false })); }} data-testid="remove-background-music">Remove</button>
+                                </div>
+                            </div>}
+                        </div>
                         <Toggle
                             icon={Film}
                             label="B-roll overlays"
@@ -724,12 +934,15 @@ export default function Editor() {
                                                 const isCustom = r.is_custom;
                                                 const isGenerated = r.generated;
                                                 return (
-                                                    <div
+                                                    <button
+                                                        type="button"
                                                         key={r.id}
-                                                        className="relative cursor-pointer border"
+                                                        className="relative cursor-pointer border text-left"
                                                         style={{
                                                             borderColor: active ? "#CCFF00" : "rgba(255,255,255,0.1)",
                                                         }}
+                                                        aria-pressed={active}
+                                                        aria-label={`${active ? "Remove" : "Select"} B-roll ${r.name || r.id} for ${m.query || "this moment"}`}
                                                         onClick={() =>
                                                             setBrollSelected((s) => ({
                                                                 ...s,
@@ -759,7 +972,7 @@ export default function Editor() {
                                                                 <Check className="w-6 h-6 text-[#ccff00]" strokeWidth={3} />
                                                             </div>
                                                         )}
-                                                    </div>
+                                                    </button>
                                                 );
                                             })}
                                         </div>
@@ -778,23 +991,48 @@ export default function Editor() {
 
             {/* VIRAL CLIPS SECTION */}
             {isReady && (
+                <>
+                {brollMoments.length > 0 && (
+                    <section className="mt-12 panel p-5" data-testid="library-target-selector">
+                        <div className="font-mono text-xs text-white/40 tracking-widest mb-2">// LIBRARY ASSIGNMENT TARGET</div>
+                        <label className="block text-sm text-white/60 mb-2" htmlFor="library-broll-target">
+                            Choose the exact B-roll moment before assigning a library asset.
+                        </label>
+                        <select
+                            id="library-broll-target"
+                            value={libraryTargetMoment}
+                            onChange={(event) => setLibraryTargetMoment(event.target.value)}
+                            className="w-full bg-black border border-white/20 px-3 py-3 text-sm text-white font-mono focus:border-[#ccff00] outline-none"
+                        >
+                            <option value="">Select a moment...</option>
+                            {brollMoments.map((moment, index) => (
+                                <option key={`${moment.word_index}-${index}`} value={String(moment.word_index)}>
+                                    Moment #{index + 1}: {moment.query || `word ${moment.word_index}`}
+                                </option>
+                            ))}
+                        </select>
+                    </section>
+                )}
                 <LibraryPanel
                     activeSelection={libraryPick}
                     niche={analysis?.quality_review?.profile || analysis?.profile || "gaming"}
                     onPickAsset={(asset) => {
-                        // If B-roll moments exist, assign to the first unassigned one
                         if (brollMoments.length > 0) {
-                            const firstFree = brollMoments.findIndex((moment) => !brollSelected[moment.word_index]);
-                            const idx = firstFree === -1 ? 0 : firstFree;
-                            const wordIndex = brollMoments[idx].word_index;
+                            if (!libraryTargetMoment) {
+                                toast.error("Choose a B-roll moment before assigning a library asset.");
+                                return;
+                            }
+                            const wordIndex = Number(libraryTargetMoment);
+                            const idx = brollMoments.findIndex((moment) => Number(moment.word_index) === wordIndex);
                             setBrollSelected((s) => ({ ...s, [wordIndex]: { ...asset, word_index: wordIndex } }));
                             setLibraryPick(asset);
-                            toast.success(`Assigned to moment #${idx + 1}${firstFree === -1 ? " (replaced)" : ""}`);
+                            toast.success(`Assigned to moment #${idx + 1}`);
                         } else {
                             setLibraryPick(libraryPick?.id === asset.id ? null : asset);
                         }
                     }}
                 />
+                </>
             )}
 
             {isReady && (
@@ -804,7 +1042,7 @@ export default function Editor() {
                             <div className="font-mono text-xs text-white/40 tracking-widest mb-2">// AI HIGHLIGHT REEL</div>
                             <div className="font-display text-3xl tracking-wider">VIRAL CLIPS</div>
                             <div className="text-white/50 text-sm mt-1">
-                                AI finds the punchiest 20-60s moments and cuts them as 9:16 shorts
+                                Ranked from story, hook, audio energy, pacing, and clarity signals
                             </div>
                         </div>
                         <button
@@ -835,7 +1073,7 @@ export default function Editor() {
                                                 #{idx + 1} · {c.start}s → {c.end}s ({c.duration}s)
                                             </div>
                                             <div
-                                                className="font-mono text-xs px-1.5 py-0.5"
+                                                className="font-mono text-xs px-1.5 py-0.5 whitespace-nowrap"
                                                 style={{
                                                     background: c.score >= 80 ? "#CCFF00"
                                                         : c.score >= 60 ? "rgba(204,255,0,0.3)"
@@ -843,7 +1081,7 @@ export default function Editor() {
                                                     color: c.score >= 80 ? "#000" : "#fff",
                                                 }}
                                             >
-                                                {c.score}
+                                                {c.score} {c.score_label ? `· ${c.score_label}` : ""}
                                             </div>
                                         </div>
                                         <div className="font-display text-lg tracking-wider mt-2 leading-tight">
@@ -851,6 +1089,33 @@ export default function Editor() {
                                         </div>
                                         <div className="text-white/70 text-sm mt-2">{c.caption}</div>
                                         <div className="text-white/40 text-xs mt-1 italic">{c.reason}</div>
+
+                                        {c.score_breakdown && (
+                                            <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mt-4 border-t border-white/10 pt-3">
+                                                {Object.entries(c.score_breakdown).map(([name, value]) => (
+                                                    <div key={name} className="min-w-0">
+                                                        <div className="font-mono text-xs uppercase text-white/45 truncate">{name}</div>
+                                                        <div className="font-mono text-sm text-white/80 mt-0.5">{value}</div>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+                                        {c.score_signals?.length > 0 && (
+                                            <div className="mt-3 space-y-1">
+                                                {c.score_signals.slice(0, 3).map((signal) => (
+                                                    <div key={signal} className="flex gap-2 text-xs text-white/50 leading-snug">
+                                                        <Check className="w-3 h-3 mt-0.5 shrink-0 text-[#CCFF00]" />
+                                                        <span>{signal}</span>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+                                        {c.hook_options?.length > 1 && (
+                                            <div className="mt-3 text-xs text-white/45">
+                                                <span className="font-mono uppercase text-xs tracking-widest">Hook rewrite</span>
+                                                <div className="text-white/70 mt-1">{c.hook_options[1]}</div>
+                                            </div>
+                                        )}
 
                                         {rendered ? (
                                             <div className="mt-4 space-y-2">
@@ -893,7 +1158,7 @@ export default function Editor() {
 
                     {!viralClips.length && !extractingClips && (
                         <div className="panel p-8 text-center text-white/40 font-mono text-sm">
-                            Click &quot;Find Viral Clips&quot; to have the AI extract the most punchy moments.
+                            Find clips to rank moments with both editorial AI and local media signals.
                         </div>
                     )}
                 </section>
@@ -916,7 +1181,7 @@ function Toggle({ icon: Icon, label, sub, checked, onChange, testid }) {
                 }}
             >
                 <div
-                    className="absolute top-0.5 w-4 h-4 transition-all"
+                    className="absolute top-0.5 w-4 h-4 transition-[left] duration-150"
                     style={{
                         left: checked ? "calc(100% - 1.125rem)" : "0.125rem",
                         background: checked ? "#000" : "rgba(255,255,255,0.5)",

@@ -15,7 +15,17 @@ from typing import Any, Dict, Optional
 
 
 def _matches(document: Dict[str, Any], query: Dict[str, Any]) -> bool:
-    return all(document.get(key) == value for key, value in query.items())
+    for key, value in query.items():
+        current = document.get(key)
+        if isinstance(value, dict):
+            if "$nin" in value and current in value["$nin"]:
+                return False
+            if "$ne" in value and current == value["$ne"]:
+                return False
+            continue
+        if current != value:
+            return False
+    return True
 
 
 def _exclude_path(document: Dict[str, Any], dotted: str) -> None:
@@ -73,13 +83,15 @@ class LocalCollection:
         async with self.database.lock:
             documents = self.database.data.setdefault(self.name, [])
             target = next((doc for doc in documents if _matches(doc, query)), None)
+            matched_count = 1 if target is not None else 0
             if target is None and upsert:
                 target = copy.deepcopy(query)
                 documents.append(target)
+                matched_count = 1
             if target is not None:
                 target.update(copy.deepcopy(update.get("$set", {})))
                 self.database._flush()
-        return {"acknowledged": True}
+        return {"acknowledged": True, "matched_count": matched_count, "modified_count": matched_count}
 
     async def delete_one(self, query: Dict[str, Any]):
         async with self.database.lock:

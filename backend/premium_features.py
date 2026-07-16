@@ -23,6 +23,7 @@ from creator_dna import (
     observation_from_analyzed_project,
 )
 from edit_chat_engine import EditCommandError, EditSession, JournalEntry, compile_chat_request, validate_command
+from editorial_quality import assess_project, rubric
 
 
 class CreatorProfileBody(BaseModel):
@@ -41,6 +42,19 @@ class EditPreviewBody(BaseModel):
 
 class ApplyPreviewBody(BaseModel):
     preview_id: str = Field(min_length=1, max_length=128)
+
+
+class VersionBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: str = Field(default="Draft", min_length=1, max_length=80)
+
+
+class MarkerBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    time: float = Field(ge=0)
+    label: str = Field(min_length=1, max_length=120)
+    kind: str = Field(default="note", min_length=1, max_length=32)
+    color: str = Field(default="#ccff00", min_length=4, max_length=16)
 
 
 def _profile_json(profile) -> dict[str, Any]:
@@ -198,6 +212,222 @@ def register_premium_routes(api, db, user_id: str, get_project, update_project, 
             _canonical(fallback), saved.history, saved.redo_stack, saved.seen_command_ids
         )
         return project, profiles, chat, session
+
+    @api.get("/projects/{pid}/editorial-team/review")
+    async def editorial_team_review(pid: str):
+        """Return deterministic, evidence-backed notes from the editorial team.
+
+        The team is intentionally a review layer over analyzed project data. It
+        does not invent footage decisions or silently mutate the edit; every
+        note includes the evidence it used and a supported edit-chat prompt.
+        """
+        project = await get_project(pid)
+        analysis = project.get("analysis") or {}
+        transcript = project.get("transcript") or {}
+        words = transcript.get("words") or []
+        fillers = analysis.get("filler_indices") or []
+        broll = analysis.get("broll_moments") or []
+        transitions = analysis.get("transitions") or []
+        audio_cues = analysis.get("audio_cues") or []
+        qa = analysis.get("quality_review") or project.get("post_render_qa") or {}
+        qa_issues = qa.get("issues") or []
+        duration = float(project.get("duration") or 0)
+        word_count = len(words)
+        filler_rate = round(len(fillers) / word_count * 100, 1) if word_count else 0
+
+        def note(note_id, role, title, detail, evidence, prompt, priority="review"):
+            return {
+                "id": note_id, "role": role, "title": title, "detail": detail,
+                "evidence": evidence, "prompt": prompt, "priority": priority,
+            }
+
+        team = [
+            {
+                "id": "story",
+                "name": "Story Editor",
+                "editorial_lens": "Emotion, intention, and cause-and-effect",
+                "color": "#ccff00",
+                "notes": [],
+            },
+            {
+                "id": "rhythm",
+                "name": "Rhythm Editor",
+                "editorial_lens": "Pacing, silence, music, and audience attention",
+                "color": "#00d9ff",
+                "notes": [],
+            },
+            {
+                "id": "performance",
+                "name": "Performance Editor",
+                "editorial_lens": "Best take, clarity, and natural delivery",
+                "color": "#ffb000",
+                "notes": [],
+            },
+            {
+                "id": "visual",
+                "name": "Visual Editor",
+                "editorial_lens": "B-roll meaning, visual continuity, and emphasis",
+                "color": "#ff4f8b",
+                "notes": [],
+            },
+            {
+                "id": "finishing",
+                "name": "Finishing Editor",
+                "editorial_lens": "Captions, audio, safe zones, rights, and delivery",
+                "color": "#a78bfa",
+                "notes": [],
+            },
+        ]
+
+        team[0]["notes"].append(note(
+            "story-context", "Story Editor", "Make the promise visible early",
+            "The first pass should make the subject and payoff legible before decorative treatment is added.",
+            [f"{word_count} transcript words", f"{duration:.1f}s source duration"],
+            "Tighten the opening around the clearest hook and keep the payoff readable.",
+            "high" if word_count and duration > 0 else "review",
+        ))
+        if not analysis.get("summary"):
+            team[0]["notes"].append(note(
+                "story-summary", "Story Editor", "Add a reviewable story summary",
+                "Analysis did not produce a summary, so the team cannot explain the cut's intended arc yet.",
+                ["analysis.summary is missing"],
+                "Set a clear hook and payoff before changing the visual style.", "high",
+            ))
+
+        team[1]["notes"].append(note(
+            "rhythm-silence", "Rhythm Editor", "Do not confuse speed with rhythm",
+            "Review pauses and transitions as a sequence. A high cut count is not automatically better.",
+            [f"{len(transitions)} detected transition cues", f"{len(audio_cues)} detected audio cues"],
+            "Review pacing around the hook and payoff; preserve intentional pauses and only tighten dead air.",
+            "review",
+        ))
+        if duration > 0 and duration < 15:
+            team[1]["notes"].append(note(
+                "rhythm-short", "Rhythm Editor", "Short-form timing needs a clean landing",
+                "This is a short source; protect the final beat instead of stacking more effects into it.",
+                [f"{duration:.1f}s duration"],
+                "Keep the final payoff intact and remove only pauses that do not carry meaning.", "medium",
+            ))
+
+        team[2]["notes"].append(note(
+            "performance-filler", "Performance Editor", "Review filler cuts by performance",
+            "Filler removal is a suggestion, not a license to flatten the speaker's timing or personality.",
+            [f"{len(fillers)} filler candidates", f"{filler_rate}% of transcript words flagged"],
+            "Remove only filler words that interrupt the thought; restore any cut that damages the performance.",
+            "high" if filler_rate > 8 else "review",
+        ))
+
+        team[3]["notes"].append(note(
+            "visual-evidence", "Visual Editor", "Every insert needs a reason",
+            "B-roll should clarify, contrast, or intensify the spoken idea; empty coverage is not a creative decision.",
+            [f"{len(broll)} B-roll moments detected"],
+            "Review each B-roll moment and keep only inserts that add information or emotional emphasis.",
+            "high" if broll else "review",
+        ))
+
+        finishing_priority = "high" if qa_issues else "review"
+        team[4]["notes"].append(note(
+            "finishing-delivery", "Finishing Editor", "Prove the export is publishable",
+            "The final pass should verify captions, audio, safe zones, and asset provenance before delivery.",
+            [f"{len(qa_issues)} QA issues recorded", f"{len(broll)} B-roll moments with provenance review"],
+            "Run the final render QA, fix any caption or audio issue, and confirm every external asset is cleared.",
+            finishing_priority,
+        ))
+
+        timeline_events = []
+        for index in fillers:
+            if 0 <= index < len(words):
+                word = words[index]
+                timeline_events.append({"time": float(word.get("start") or 0), "type": "filler", "label": str(word.get("word") or "filler")})
+        for moment in broll:
+            word_index = moment.get("word_index")
+            if isinstance(word_index, int) and 0 <= word_index < len(words):
+                timeline_events.append({"time": float(words[word_index].get("start") or 0), "type": "broll", "label": str(moment.get("query") or "B-roll")})
+        for cue in [*transitions, *audio_cues]:
+            word_index = cue.get("word_index")
+            if isinstance(word_index, int) and 0 <= word_index < len(words):
+                timeline_events.append({"time": float(words[word_index].get("start") or 0), "type": cue.get("type") or "cue", "label": str(cue.get("label") or cue.get("cue_type") or cue.get("type") or "cue")})
+        timeline_events.sort(key=lambda item: item["time"])
+
+        return {
+            "project_id": pid,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "status": "review_ready",
+            "quality": assess_project(project),
+            "rubric": {"schema_version": rubric().get("schema_version"), "principle_count": len(rubric().get("principles") or [])},
+            "team": team,
+            "timeline": {"duration": duration, "events": timeline_events[:200]},
+            "principles": [
+                "Evidence before assertion",
+                "Review before apply",
+                "Performance before cosmetic continuity",
+                "Meaning before decoration",
+                "Quality gates before delivery",
+            ],
+        }
+
+    @api.get("/projects/{pid}/edit-versions")
+    async def list_edit_versions(pid: str):
+        project = await get_project(pid)
+        return {"versions": project.get("edit_versions") or []}
+
+    @api.post("/projects/{pid}/edit-versions")
+    async def save_edit_version(pid: str, body: VersionBody):
+        project = await get_project(pid)
+        versions = list(project.get("edit_versions") or [])
+        version = {
+            "id": "version_" + uuid.uuid4().hex[:16],
+            "name": body.name.strip(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "snapshot": {
+                key: copy.deepcopy(project.get(key))
+                for key in ("analysis", "render_options", "edit_options", "chat_render_options", "chat_timeline", "creator_profile_id")
+            },
+        }
+        versions.append(version)
+        await update_project(pid, edit_versions=versions[-20:])
+        return {"version": version, "versions": versions[-20:]}
+
+    @api.post("/projects/{pid}/edit-versions/{version_id}/restore")
+    async def restore_edit_version(pid: str, version_id: str):
+        project = await get_project(pid)
+        version = next((item for item in project.get("edit_versions") or [] if item.get("id") == version_id), None)
+        if not version:
+            raise HTTPException(404, "Edit version not found")
+        snapshot = version.get("snapshot") or {}
+        await update_project(pid, **{key: copy.deepcopy(snapshot.get(key)) for key in ("analysis", "render_options", "edit_options", "chat_render_options", "chat_timeline", "creator_profile_id")})
+        return {"status": "restored", "version": version, "project": await get_project(pid)}
+
+    @api.get("/projects/{pid}/markers")
+    async def list_markers(pid: str):
+        project = await get_project(pid)
+        return {"markers": project.get("edit_markers") or []}
+
+    @api.post("/projects/{pid}/markers")
+    async def create_marker(pid: str, body: MarkerBody):
+        project = await get_project(pid)
+        duration = float(project.get("duration") or 0)
+        if duration and body.time > duration:
+            raise HTTPException(422, f"Marker time must be within the {duration:.2f}s project")
+        markers = list(project.get("edit_markers") or [])
+        marker = {
+            "id": "marker_" + uuid.uuid4().hex[:16],
+            **body.model_dump(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        markers.append(marker)
+        markers.sort(key=lambda item: float(item.get("time") or 0))
+        await update_project(pid, edit_markers=markers[-200:])
+        return {"marker": marker, "markers": markers[-200:]}
+
+    @api.delete("/projects/{pid}/markers/{marker_id}")
+    async def delete_marker(pid: str, marker_id: str):
+        project = await get_project(pid)
+        markers = [item for item in project.get("edit_markers") or [] if item.get("id") != marker_id]
+        if len(markers) == len(project.get("edit_markers") or []):
+            raise HTTPException(404, "Marker not found")
+        await update_project(pid, edit_markers=markers)
+        return {"status": "deleted", "markers": markers}
 
     @api.get("/projects/{pid}/edit-chat/history")
     async def edit_chat_history(pid: str):

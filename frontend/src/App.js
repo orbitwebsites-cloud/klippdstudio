@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useState } from "react";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { Toaster } from "sonner";
 import TopBar from "@/components/TopBar";
 import Landing from "@/pages/Landing";
@@ -9,6 +9,8 @@ import "@/App.css";
 const Editor = lazy(() => import("@/pages/Editor"));
 const TrainingLab = lazy(() => import("@/pages/TrainingLab"));
 const Pricing = lazy(() => import("@/pages/Pricing"));
+const Library = lazy(() => import("@/pages/Library"));
+const Settings = lazy(() => import("@/pages/Settings"));
 
 function RouteLoading() {
     return <div className="min-h-[calc(100vh-72px)]" aria-busy="true" />;
@@ -38,9 +40,16 @@ function App() {
                 <Route path="/training" element={
                     <Suspense fallback={<RouteLoading />}><TrainingLab /></Suspense>
                 } />
+                <Route path="/library" element={
+                    <Suspense fallback={<RouteLoading />}><Library /></Suspense>
+                } />
                 <Route path="/pricing" element={
                     <Suspense fallback={<RouteLoading />}><Pricing /></Suspense>
                 } />
+                <Route path="/settings" element={
+                    <Suspense fallback={<RouteLoading />}><Settings /></Suspense>
+                } />
+                <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
             <Toaster
                 theme="dark"

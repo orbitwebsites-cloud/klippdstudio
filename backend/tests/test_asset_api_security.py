@@ -158,6 +158,42 @@ def test_asset_pack_status_and_resolve_preserve_orchestrator_response_shape(api_
     assert body["assets"][0]["name"] == "health.png"
     assert body["requested"] == {"niche": "gaming", "tags": ["health", "ui"]}
 
+    resolved_body = api_env.client.post("/api/asset-packs/resolve", json={"niche": "minecraft", "tags": ["inventory", "hud"]})
+    assert resolved_body.status_code == 200
+    assert resolved_body.json()["requested"] == {"niche": "minecraft", "tags": ["inventory", "hud"]}
+
+
+def test_checkout_rejects_existing_active_subscription(api_env, monkeypatch):
+    monkeypatch.setattr(server, "STRIPE_SECRET_KEY", "sk_test")
+    monkeypatch.setenv("STRIPE_PRICE_PRO", "price_pro")
+    asyncio.run(api_env.db.settings.insert_one({
+        "user_id": server.USER_ID,
+        "billing_subscription": {"customer_id": "cus_123", "status": "active", "plan": "basic"},
+    }))
+
+    response = api_env.client.post("/api/billing/checkout", json={"plan": "pro"})
+
+    assert response.status_code == 409
+    assert "already has an active Stripe subscription" in response.json()["detail"]
+
+
+def test_training_url_canonicalization_preserves_semantic_query_params():
+    first = server._canonical_training_url("https://example.com/video?id=1&utm_source=newsletter")
+    second = server._canonical_training_url("https://example.com/video?id=2&utm_source=newsletter")
+
+    assert first == "https://example.com/video?id=1"
+    assert second == "https://example.com/video?id=2"
+    assert first != second
+
+
+def test_training_url_canonicalization_preserves_youtube_semantic_query_params():
+    first = server._canonical_training_url("https://www.youtube.com/watch?v=abc123&t=12s&utm_source=x")
+    second = server._canonical_training_url("https://youtu.be/abc123?start=30&list=playlist&utm_medium=y")
+
+    assert first == "https://www.youtube.com/watch?t=12s&v=abc123"
+    assert second == "https://www.youtube.com/watch?list=playlist&start=30&v=abc123"
+    assert first != second
+
 
 def test_analysis_uses_semantic_pack_match_and_generates_only_the_unmatched_request(api_env, monkeypatch):
     incoming = api_env.quarantine_dir / "incoming" / "semantic"

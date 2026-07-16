@@ -5,8 +5,9 @@ import {
     analyzeCreatorProfile,
     apiErrorMessage,
     createCreatorProfile,
+    featureAccessState,
     getCreatorProfiles,
-    isFeatureUnavailable,
+    listProjects,
 } from "@/lib/klipApi";
 
 const emptyReference = () => ({ type: "owned_project", value: "" });
@@ -29,11 +30,12 @@ const evidenceText = (item) => {
 
 export default function CreatorProfilesPanel({ selectedProfileId, onSelectProfile }) {
     const [profiles, setProfiles] = useState([]);
-    const [available, setAvailable] = useState(true);
+    const [featureState, setFeatureState] = useState("available");
     const [loading, setLoading] = useState(true);
     const [composerOpen, setComposerOpen] = useState(false);
     const [name, setName] = useState("");
     const [references, setReferences] = useState([emptyReference()]);
+    const [projects, setProjects] = useState([]);
     const [rightsConfirmed, setRightsConfirmed] = useState(false);
     const [analyzing, setAnalyzing] = useState(false);
 
@@ -44,7 +46,8 @@ export default function CreatorProfilesPanel({ selectedProfileId, onSelectProfil
             setProfiles(next);
             if (!selectedProfileId && next[0]?.id) onSelectProfile?.(next[0].id);
         } catch (error) {
-            if (isFeatureUnavailable(error)) setAvailable(false);
+            const access = featureAccessState(error);
+            if (access) setFeatureState(access);
             else toast.error(apiErrorMessage(error, "Creator profiles could not be loaded"));
         } finally {
             setLoading(false);
@@ -52,6 +55,12 @@ export default function CreatorProfilesPanel({ selectedProfileId, onSelectProfil
     }, [onSelectProfile, selectedProfileId]);
 
     useEffect(() => { loadProfiles(); }, [loadProfiles]);
+
+    useEffect(() => {
+        listProjects()
+            .then((items) => setProjects(items.filter((project) => project?.id && project?.analysis)))
+            .catch(() => setProjects([]));
+    }, []);
 
     const selectedProfile = useMemo(
         () => profiles.find((profile) => String(profile.id) === String(selectedProfileId)),
@@ -97,14 +106,30 @@ export default function CreatorProfilesPanel({ selectedProfileId, onSelectProfil
             setRightsConfirmed(false);
             toast.success("Creator DNA profile is ready");
         } catch (error) {
-            if (isFeatureUnavailable(error)) setAvailable(false);
+            const access = featureAccessState(error);
+            if (access) setFeatureState(access);
             else toast.error(apiErrorMessage(error, "Style analysis failed"));
         } finally {
             setAnalyzing(false);
         }
     };
 
-    if (!available) return null;
+    if (featureState !== "available") {
+        const upgrade = featureState === "upgrade";
+        return (
+            <section className="panel p-5" data-testid="creator-profiles-unavailable">
+                <div className="font-mono text-[10px] text-[#ccff00] tracking-widest">// CREATOR DNA</div>
+                <h2 className="font-display text-3xl tracking-wider mt-2">
+                    {upgrade ? "CREATOR DNA NEEDS AN UPGRADE" : "WORKSPACE FEATURE UNAVAILABLE"}
+                </h2>
+                <p className="text-white/55 text-sm leading-6 mt-3">
+                    {upgrade
+                        ? "Creator DNA is enabled on the backend, but this workspace plan cannot use it yet."
+                        : "Creator DNA is visible in this editor, but the backend route is not enabled for this workspace yet."}
+                </p>
+            </section>
+        );
+    }
 
     const confidence = selectedProfile?.confidence ?? selectedProfile?.analysis?.confidence;
     const confidencePercent = confidence == null ? null : Math.round(Number(confidence) <= 1 ? Number(confidence) * 100 : Number(confidence));
@@ -185,15 +210,21 @@ export default function CreatorProfilesPanel({ selectedProfileId, onSelectProfil
                     {references.map((reference, index) => (
                         <div key={index} className="grid grid-cols-[1fr_32px] gap-2">
                             <div className="col-span-2 font-mono text-[9px] text-white/40 tracking-widest">
-                                OWNED KLIPPED PROJECT ID
+                                OWNED KLIPPED PROJECT
                             </div>
-                            <input
+                            <select
                                 value={reference.value}
                                 onChange={(event) => updateReference(index, { value: event.target.value })}
-                                placeholder="PASTE A PROJECT ID FROM YOUR KLIPPED LIBRARY"
                                 className="min-w-0 bg-black border border-white/20 px-2 py-2 text-xs text-white font-mono placeholder:text-white/25 focus:border-[#ccff00] outline-none"
-                                aria-label={`Owned Klipped project ID ${index + 1}`}
-                            />
+                                aria-label={`Owned Klipped project ${index + 1}`}
+                            >
+                                <option value="">Select analyzed project...</option>
+                                {projects.map((project) => (
+                                    <option key={project.id} value={project.id}>
+                                        {project.name || project.id}
+                                    </option>
+                                ))}
+                            </select>
                             <button
                                 type="button"
                                 onClick={() => setReferences((current) => current.length === 1 ? [emptyReference()] : current.filter((_, i) => i !== index))}
@@ -205,6 +236,11 @@ export default function CreatorProfilesPanel({ selectedProfileId, onSelectProfil
                     <button type="button" className="text-[10px] font-mono tracking-widest text-[#ccff00]" onClick={() => setReferences((current) => [...current, emptyReference()])}>
                         + ADD REFERENCE
                     </button>
+                    {!projects.length && (
+                        <div className="border border-white/10 bg-white/[0.03] p-3 text-[11px] text-white/45 leading-relaxed">
+                            Analyze at least one owned project before creating Creator DNA. Only analyzed projects can provide editing-style evidence.
+                        </div>
+                    )}
                     <label className="flex items-start gap-2 text-[11px] text-white/60 cursor-pointer leading-relaxed">
                         <input
                             type="checkbox"

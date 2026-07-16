@@ -21,7 +21,7 @@ SCHEMA_VERSION = "klippd.edit_command.v1"
 MAX_OPERATIONS = 32
 MAX_WORDS_PER_OPERATION = 500
 MAX_TIMELINE_EVENTS = 64
-ALLOWED_STYLES = {"tiktok", "youtube", "luxury"}
+ALLOWED_STYLES = {"tiktok", "youtube", "luxury", "marketing", "editorial"}
 ALLOWED_ASPECTS = {"16:9", "9:16", "1:1"}
 ALLOWED_CAPTION_PRESETS = {"default", "bold", "minimal", "luxury"}
 ALLOWED_CAPTION_PLACEMENTS = {"top", "center", "bottom"}
@@ -488,6 +488,17 @@ def compile_chat_request(
     directives = _creator_directives(creator_grammar)
     raw, lowered = text.strip(), text.strip().lower()
     operations: list[Dict[str, Any]] = []
+    if re.search(r"\b(?:marketing|growth|promotional|ad)\s+(?:edit|cut|version)\b", lowered):
+        operations.append({"type": "set_render_format", "style": "marketing", "aspect": "9:16"})
+        operations.append({"type": "set_hook_pacing", "end_seconds": 5.0, "target": "faster"})
+        keywords = _transcript_keyword_indices(project_state)
+        caption_op = {"type": "set_captions", "enabled": True, "preset": "bold", "placement": "bottom"}
+        if keywords:
+            caption_op["highlight_word_indices"] = keywords[: min(12, len(keywords))]
+        operations.append(caption_op)
+    elif re.search(r"\b(?:editorial|premium|real estate)\s+(?:edit|cut|version)\b", lowered):
+        operations.append({"type": "set_render_format", "style": "editorial"})
+        operations.append({"type": "set_captions", "enabled": True, "preset": "luxury", "placement": "bottom"})
     pacing = re.search(r"(?:make\s+)?(?:the\s+)?first\s+(\d+(?:\.\d+)?)\s*seconds?\s+(faster|tighter|balanced)", lowered)
     if pacing:
         target = {"tighter": "tight"}.get(pacing.group(2), pacing.group(2))

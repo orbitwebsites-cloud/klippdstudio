@@ -67,4 +67,5 @@ def test_ass_captions_remap_after_removed_segment(tmp_path):
     content = output.read_text(encoding="utf-8")
     assert "first" in content
     assert "second" in content
-    assert "Dialogue: 0,0:00:00.50,0:00:00.90,Emph" in content
+    assert "Dialogue: 0,0:00:00.00,0:00:00.90,Emph" in content
+    assert "first second" in content

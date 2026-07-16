@@ -84,6 +84,41 @@ def test_creator_dna_rejects_client_supplied_observations(tmp_path):
     assert any(item["type"] == "extra_forbidden" for item in response.json()["detail"])
 
 
+def test_editorial_team_review_is_evidence_backed_and_non_mutating(tmp_path):
+    client, db = _client(tmp_path)
+    before = asyncio.run(db.projects.find_one({"id": "owned-project"}))
+    response = client.get("/api/projects/owned-project/editorial-team/review")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert [member["id"] for member in payload["team"]] == ["story", "rhythm", "performance", "visual", "finishing"]
+    assert payload["timeline"]["events"]
+    assert any("2 filler candidates" in item for item in payload["team"][2]["notes"][0]["evidence"])
+    after = asyncio.run(db.projects.find_one({"id": "owned-project"}))
+    assert after == before
+
+
+def test_edit_versions_save_and_restore_a_snapshot(tmp_path):
+    client, db = _client(tmp_path)
+    saved = client.post("/api/projects/owned-project/edit-versions", json={"name": "Before bold pass"})
+    assert saved.status_code == 200, saved.text
+    version_id = saved.json()["version"]["id"]
+    asyncio.run(db.projects.update_one({"id": "owned-project"}, {"$set": {"analysis": {"changed": True}}}))
+    restored = client.post(f"/api/projects/owned-project/edit-versions/{version_id}/restore")
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["project"]["analysis"]["filler_indices"] == [2, 7]
+
+
+def test_project_markers_are_persistent_and_time_bounded(tmp_path):
+    client, _ = _client(tmp_path)
+    created = client.post("/api/projects/owned-project/markers", json={"time": 12.5, "label": "Best reaction"})
+    assert created.status_code == 200, created.text
+    marker = created.json()["marker"]
+    listed = client.get("/api/projects/owned-project/markers").json()["markers"]
+    assert listed[0]["label"] == "Best reaction"
+    assert client.post("/api/projects/owned-project/markers", json={"time": 61, "label": "Outside"}).status_code == 422
+    assert client.delete(f"/api/projects/owned-project/markers/{marker['id']}").status_code == 200
+
+
 def test_creator_dna_converts_internal_schema_validation_to_422(tmp_path):
     client, _ = _client(tmp_path)
     response = client.post("/api/creator-profiles/analyze", json={

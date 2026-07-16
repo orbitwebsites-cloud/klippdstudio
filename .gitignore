@@ -99,5 +99,14 @@ data/uploads_tmp/
 data/broll/
 data/klipped-db.json
 data/.master-key
+data/music/
+data/output/
+data/subtitles/
+data/videos/
+data/editorial_bakeoff/
+data/talking_head_klippd/
+data/*.mp4
+data/*.jpg
+tools/.vendor/
 *.uploading
 *.part
