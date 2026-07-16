@@ -263,6 +263,7 @@ def _apply_operation(state: Dict[str, Any], op: Mapping[str, Any]) -> None:
             asset = next(item for item in state["asset_library"] if item.get("id") == op["asset_id"])
             selected.append({key: _copy(asset[key]) for key in ("id", "video_url", "local_path", "is_custom", "generated") if key in asset} | {"word_index": op["word_index"]})
             selected.sort(key=lambda item: item["word_index"])
+            render["broll"] = True
     elif kind == "set_emphasis":
         values = set(analysis.get("emphasis_indices", []))
         values = values | set(op["word_indices"]) if op["enabled"] else values - set(op["word_indices"])
@@ -520,6 +521,37 @@ def compile_chat_request(
         if not isinstance(selected_index, int):
             raise EditCommandError("selection_required", "Select a B-roll moment before asking to remove this B-roll.")
         operations.append({"type": "set_broll", "action": "remove", "word_index": selected_index})
+    if re.search(r"\b(?:add|insert|include|use)\s+(?:some\s+)?b-?roll\b", lowered):
+        moments = [
+            item for item in project_state.get("analysis", {}).get("broll_moments", [])
+            if isinstance(item, Mapping) and isinstance(item.get("word_index"), int)
+        ]
+        if not moments:
+            raise EditCommandError("missing_timeline_anchor", "I could not find a transcript-grounded B-roll moment to place footage on.")
+        selected = {
+            item.get("word_index") for item in project_state.get("render_options", {}).get("selected_broll", [])
+            if isinstance(item, Mapping) and isinstance(item.get("word_index"), int)
+        }
+        assets = [
+            item for item in project_state.get("asset_library", [])
+            if isinstance(item, Mapping) and item.get("approved") is True and item.get("id")
+        ]
+        if not assets:
+            raise EditCommandError("no_approved_asset", "There are no approved B-roll assets available. Search the approved pack or upload a rights-attested clip first.")
+        unused_assets = list(assets)
+        for moment in moments:
+            word_index = moment["word_index"]
+            if word_index in selected:
+                continue
+            matching = next((asset for asset in unused_assets if asset.get("word_index") == word_index), None)
+            asset = matching or unused_assets[0]
+            operations.append({"type": "set_broll", "action": "assign", "word_index": word_index, "asset_id": asset["id"]})
+            if matching:
+                unused_assets.remove(matching)
+            if len(operations) >= MAX_OPERATIONS:
+                break
+        if not any(operation.get("type") == "set_broll" and operation.get("action") == "assign" for operation in operations):
+            raise EditCommandError("broll_already_assigned", "Approved B-roll is already assigned to every available moment.")
     if re.search(r"\bmore impact (?:on|at|for|to) (?:the )?reveal\b", lowered):
         beats = project_state.get("analysis", {}).get("story_beats", [])
         reveal = next((item for item in beats if item.get("beat_type") in {"reveal", "payoff"}), None)

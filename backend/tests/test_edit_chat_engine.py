@@ -65,6 +65,32 @@ def test_compile_supported_examples():
     assert [op["type"] for op in impact["operations"]] == ["set_emphasis", "set_timeline_cue"]
 
 
+def test_compile_and_apply_add_broll_assigns_approved_assets_to_unassigned_moments():
+    state = project()
+    state["analysis"]["broll_moments"] = [
+        {"word_index": 12, "query": "crafting table"},
+        {"word_index": 20, "query": "village reveal"},
+    ]
+    state["asset_library"] = [
+        {"id": "pack-12", "approved": True, "word_index": 12, "video_url": "file:///pack-12.mp4"},
+        {"id": "pack-20", "approved": True, "word_index": 20, "video_url": "file:///pack-20.mp4"},
+    ]
+
+    compiled = compile_chat_request("Add B-roll", state)
+    assert [op["asset_id"] for op in compiled["operations"]] == ["pack-12", "pack-20"]
+    applied = apply_command(state, compiled)
+    assert [item["word_index"] for item in applied["render_options"]["selected_broll"]] == [8, 12, 20]
+    assert applied["render_options"]["broll"] is True
+
+
+def test_add_broll_explains_when_no_approved_asset_exists():
+    state = project()
+    state["analysis"]["broll_moments"] = [{"word_index": 12, "query": "crafting table"}]
+    state["asset_library"] = []
+    with pytest.raises(EditCommandError, match="approved B-roll assets"):
+        compile_chat_request("Add B-roll", state)
+
+
 def test_compile_shipped_suggestion_tightens_transcript_grounded_fillers():
     state = project()
     state["transcript"]["words"][7]["word"] = "um"
