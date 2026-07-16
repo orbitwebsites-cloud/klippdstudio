@@ -1,4 +1,4 @@
-from editorial_quality import assess_project, rubric
+from editorial_quality import assess_project, post_render_qa_fingerprint, rubric
 
 
 def _project():
@@ -41,3 +41,40 @@ def test_quality_score_flags_missing_story_and_review_anchor():
     result = assess_project(project)
     assert next(item for item in result["checks"] if item["id"] == "story_before_style")["status"] == "needs_review"
     assert next(item for item in result["checks"] if item["id"] == "reviewable_changes")["status"] == "needs_review"
+
+
+def test_post_render_qa_overrides_passing_analysis_qa_and_blocks_delivery():
+    project = _project()
+    project["output_path"] = "/renders/final.mp4"
+    project["post_render_qa"] = {
+        "schema_version": "klippd.post_render_qa.v1",
+        "passed": False,
+        "hard_fail": True,
+        "issues": [{"code": "audio_clipping", "severity": "critical"}],
+    }
+
+    result = assess_project(project)
+
+    delivery = next(item for item in result["checks"] if item["id"] == "delivery_is_part_of_editing")
+    assert result["qa_source"] == "post_render_qa"
+    assert result["delivery_blocked"] is True
+    assert result["publish_ready"] is False
+    assert result["verdict"] == "blocked_by_post_render_qa"
+    assert delivery["status"] == "blocked"
+
+
+def test_acknowledgment_only_applies_to_the_exact_post_render_review():
+    project = _project()
+    review = {"passed": False, "hard_fail": True, "issues": [{"code": "render_corrupt"}]}
+    project.update({
+        "output_path": "/renders/final.mp4",
+        "post_render_qa": review,
+        "post_render_qa_acknowledgment": {
+            "acknowledged": True,
+            "qa_fingerprint": post_render_qa_fingerprint(review),
+        },
+    })
+    assert assess_project(project)["delivery_blocked"] is False
+
+    project["post_render_qa"] = {**review, "issues": [{"code": "new_render_failure"}]}
+    assert assess_project(project)["delivery_blocked"] is True

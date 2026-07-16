@@ -1,19 +1,20 @@
 import { useEffect, useState } from "react";
-import { Brain, Check, Crown, Gamepad2, Loader2, PenLine, ScanFace, Sparkles, Timer, Zap } from "lucide-react";
+import { Check, Crown, Loader2, Sparkles, Zap } from "lucide-react";
 import { toast } from "sonner";
 import { apiErrorMessage, createBillingPortal, createCheckout, getSubscription } from "@/lib/klipApi";
 
-const PLANS = [
+export const PLANS = [
     {
         id: "basic",
         name: "Starter",
         price: "$19",
-        suffix: "/mo",
-        kicker: "Private beta workspace",
+        suffix: "USD/mo",
+        kicker: "Core editor tools",
         retention: "7-day project retention",
-        summary: "More monthly output for solo creators who want clipping, captions, B-roll, and export-ready edits.",
+        summary: "Core editing and export tools for solo creators. Automated viral clip extraction is available on Pro.",
+        clipExtraction: "Upgrade to Pro for viral clip extraction ($29 USD/month)",
         features: [
-            "AI clip suggestions and editor workflow",
+            "Manual editor workflow and range exports",
             "Gaming-aware edit planning",
             "Animated captions for short-form formats",
             "Full editor included, not a locked basic cutter",
@@ -31,10 +32,12 @@ const PLANS = [
         kicker: "Premium editor tools",
         retention: "30-day project retention",
         featured: true,
-        summary: "A premium editor plan for Creator DNA, edit chat, B-roll, and richer project controls.",
+        summary: "Viral clip extraction plus Creator DNA, edit chat, B-roll, and richer project controls.",
+        clipExtraction: "Viral clip extraction included",
         stats: ["Creator DNA", "Edit chat"],
         features: [
             "Everything in Starter plan",
+            "Ranked viral clip extraction and short-form render workflow",
             "Creator DNA from owned Klipped projects",
             "Edit Copilot previews for pacing, captions, cuts, B-roll, and emphasis",
             "Approved library and generated B-roll support",
@@ -68,36 +71,30 @@ const VALUE_STACK = [
     { metric: "Included", label: "B-roll, captions, filler cuts, exports", detail: "The core editing workflow is bundled into the product surface instead of hidden behind extra screens." },
 ];
 
-const OPUS_GAPS = [
+export const WORKFLOW_CAPABILITIES = [
     {
-        icon: Gamepad2,
-        weakness: "Generic podcast-first scoring",
-        advantage: "Gaming and general editing profiles keep clip planning grounded in the workflows currently available in Klipped.",
+        title: "Editing profiles",
+        detail: "Gaming and general editing profiles keep clip planning grounded in the workflows currently available in Klipped.",
     },
     {
-        icon: Brain,
-        weakness: "Static generic score",
-        advantage: "Creator DNA learns editing grammar from owned Klipped projects, including pacing, captions, cuts, and visual rhythm.",
+        title: "Creator DNA",
+        detail: "Creator DNA uses owned Klipped projects to inform pacing, captions, cuts, and visual rhythm.",
     },
     {
-        icon: Sparkles,
-        weakness: "Opaque editing decisions",
-        advantage: "Post-render QA and visible edit controls keep quality checks inside the editor instead of hidden after export.",
+        title: "Visible quality review",
+        detail: "Post-render QA and visible edit controls keep quality checks inside the editor workflow.",
     },
     {
-        icon: PenLine,
-        weakness: "Finds clips but does not improve them",
-        advantage: "Edit-chat previews turn a rough plan into a reviewable edit before render.",
+        title: "Reviewable edit chat",
+        detail: "Edit-chat previews turn a rough plan into a reviewable edit before render.",
     },
     {
-        icon: ScanFace,
-        weakness: "B-roll choices are hard to audit",
-        advantage: "Explicit B-roll targets and approved library assets make insert choices visible before rendering.",
+        title: "Auditable B-roll",
+        detail: "Explicit B-roll targets and approved library assets make insert choices visible before rendering.",
     },
     {
-        icon: Timer,
-        weakness: "Slow and expensive at scale",
-        advantage: "Workflow automation for creators publishing every week, without hiding the editor behind disconnected tools.",
+        title: "Connected workflow",
+        detail: "Editing controls, review, rendering, and delivery stay together in one project workspace.",
     },
 ];
 
@@ -183,7 +180,7 @@ export default function Pricing() {
             <div className="max-w-6xl mx-auto">
                 <div className="font-mono text-xs tracking-widest text-[#ccff00] mb-5">KLIPPED STUDIO PLANS</div>
                 <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-5 mb-12">
-                    <h1 className="font-heading text-5xl md:text-7xl leading-[0.9] tracking-wider">BEAT OPUS.<br />SHIP FASTER.</h1>
+                    <h1 className="font-heading text-5xl md:text-7xl leading-[0.9] tracking-wider">EDIT WITH CONTROL.<br />SHIP FASTER.</h1>
                     <div className="font-mono text-xs text-white/50 max-w-sm leading-6">
                         Clear plan gates, visible editor tools, and fewer upgrade traps. Your active plan is <span className="text-white">{subscriptionLoading ? "LOADING" : activePlan.toUpperCase()}</span>.
                     </div>
@@ -208,7 +205,7 @@ export default function Pricing() {
                 <section className="mb-4 border border-white/10 bg-black">
                     <div className="grid grid-cols-1 lg:grid-cols-[0.9fr_1.4fr]">
                         <div className="p-6 sm:p-8 border-b lg:border-b-0 lg:border-r border-white/10">
-                            <div className="font-mono text-xs tracking-widest text-[#ccff00]">// WHY CREATORS SWITCH</div>
+                            <div className="font-mono text-xs tracking-widest text-[#ccff00]">// EDITOR WORKFLOW</div>
                             <h2 className="mt-4 font-heading text-4xl md:text-5xl leading-none tracking-wider">
                                 BUILT AROUND YOUR EDITING RULES.
                                 <br />
@@ -219,18 +216,16 @@ export default function Pricing() {
                             </p>
                         </div>
                         <div className="grid grid-cols-1 sm:grid-cols-2">
-                            {OPUS_GAPS.map((item, index) => {
-                                const Icon = item.icon;
+                            {WORKFLOW_CAPABILITIES.map((item, index) => {
                                 const borderClass = [
-                                    index < OPUS_GAPS.length - 1 ? "border-b" : "",
+                                    index < WORKFLOW_CAPABILITIES.length - 1 ? "border-b" : "",
                                     index % 2 === 0 ? "sm:border-r" : "",
-                                    index >= OPUS_GAPS.length - 2 ? "sm:border-b-0" : "",
+                                    index >= WORKFLOW_CAPABILITIES.length - 2 ? "sm:border-b-0" : "",
                                 ].filter(Boolean).join(" ");
                                 return (
-                                    <article key={item.weakness} className={`p-5 border-white/10 ${borderClass}`}>
-                                        <Icon className="w-5 h-5 text-[#ccff00]" />
-                                        <div className="mt-4 font-mono text-[11px] uppercase text-white/35 leading-5">Opus gap: {item.weakness}</div>
-                                        <p className="mt-2 text-sm text-white/78 leading-6">{item.advantage}</p>
+                                    <article key={item.title} className={`p-5 border-white/10 ${borderClass}`}>
+                                        <div className="font-mono text-[11px] uppercase text-[#ccff00] leading-5">{item.title}</div>
+                                        <p className="mt-2 text-sm text-white/78 leading-6">{item.detail}</p>
                                     </article>
                                 );
                             })}
@@ -269,6 +264,7 @@ export default function Pricing() {
                                         ))}
                                     </div>
                                 )}
+                                {plan.clipExtraction && <div className="mt-4 border border-white/10 px-3 py-3 font-mono text-[11px] text-white/65 uppercase" data-testid={`clip-extraction-${plan.id}`}>{plan.clipExtraction}</div>}
                                 <ul className="mt-6 space-y-3 flex-1 text-sm text-white/75">
                                     {plan.features.map((feature) => (
                                         <li key={feature} className="flex gap-3 leading-5">

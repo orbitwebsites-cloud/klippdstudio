@@ -31,6 +31,8 @@ jobs:
       STRIPE_PRICE_BASIC: ${{ secrets.STRIPE_PRICE_BASIC }}
       STRIPE_PRICE_PRO: ${{ secrets.STRIPE_PRICE_PRO }}
       STRIPE_PRICE_ELITE: ${{ secrets.STRIPE_PRICE_ELITE }}
+      CLERK_ISSUER: https://clerk.klippdstudio.com
+      CLERK_JWKS_URL: https://clerk.klippdstudio.com/.well-known/jwks.json
       CORS_ORIGINS: https://klippdstudio.com,https://www.klippdstudio.com
     steps:
       - uses: actions/checkout@v4
@@ -96,6 +98,8 @@ jobs:
           STRIPE_PRICE_BASIC=$STRIPE_PRICE_BASIC
           STRIPE_PRICE_PRO=$STRIPE_PRICE_PRO
           STRIPE_PRICE_ELITE=$STRIPE_PRICE_ELITE
+          CLERK_ISSUER=$CLERK_ISSUER
+          CLERK_JWKS_URL=$CLERK_JWKS_URL
           FRONTEND_URL=https://klippdstudio.com
           RETENTION_SWEEP_HOURS=6
           DATA_DIR=/app/data

@@ -20,6 +20,7 @@ from starlette.middleware.cors import CORSMiddleware
 from cryptography.fernet import Fernet
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from typing import List, Optional, Dict, Any, Literal
+from contextvars import ContextVar
 from pathlib import Path
 import os
 import re
@@ -32,6 +33,7 @@ import asyncio
 import time
 import aiofiles
 import stripe
+import jwt
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
@@ -39,6 +41,7 @@ import ai_services as ai
 import asset_generator
 from asset_pack_manager import AssetPackManager, AssetPolicyError, sha256_file
 from asset_provider_orchestrator import AssetProviderOrchestrator, rank_pack_assets
+from editorial_quality import post_render_hard_failure_blocked
 import video_processor as vp
 import post_render_qa
 from local_store import LocalDatabase
@@ -90,8 +93,18 @@ UPLOAD_COMPRESSION_MAX_WIDTH = int(os.environ.get("UPLOAD_COMPRESSION_MAX_WIDTH"
 UPLOAD_COMPRESSION_CRF = int(os.environ.get("UPLOAD_COMPRESSION_CRF", "26"))
 RETENTION_SWEEP_HOURS = max(1, int(os.environ.get("RETENTION_SWEEP_HOURS", "6")))
 CHUNK_BYTES = 4 * 1024 * 1024
+JOB_LEASE_SECONDS = max(30, int(os.environ.get("JOB_LEASE_SECONDS", "300")))
+JOB_HEARTBEAT_SECONDS = max(1, min(30, JOB_LEASE_SECONDS // 3))
 
-USER_ID = "default_user"  # single-user MVP
+ANALYSIS_ACTIVE_STATUSES = {"queued", "extracting_audio", "transcribing", "analyzing"}
+RENDER_ACTIVE_STATUSES = {"queued_render", "rendering"}
+ACTIVE_JOB_STATUSES = ANALYSIS_ACTIVE_STATUSES | RENDER_ACTIVE_STATUSES
+
+_current_user_id: ContextVar[str] = ContextVar("current_user_id", default="default_user")
+
+
+def current_user_id() -> str:
+    return _current_user_id.get()
 
 PLAN_POLICIES = {
     "basic": {"price_usd_monthly": 19, "retention_days": 7},
@@ -133,6 +146,10 @@ logger = logging.getLogger("backend")
 app = FastAPI(title="AI Video Editor")
 api = APIRouter(prefix="/api")
 APP_ACCESS_TOKEN = os.environ.get("APP_ACCESS_TOKEN", "").strip()
+CLERK_JWKS_URL = os.environ.get("CLERK_JWKS_URL", "").strip()
+CLERK_ISSUER = os.environ.get("CLERK_ISSUER", "").strip()
+CLERK_AUDIENCE = os.environ.get("CLERK_AUDIENCE", "").strip() or None
+CLERK_JWKS_CLIENT = jwt.PyJWKClient(CLERK_JWKS_URL) if CLERK_JWKS_URL else None
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000").rstrip("/")
@@ -142,16 +159,43 @@ if STRIPE_SECRET_KEY:
 
 @app.middleware("http")
 async def optional_access_token(request: Request, call_next):
-    """Optional MVP gate; leave unset locally and protect public deployments."""
-    if APP_ACCESS_TOKEN and request.method != "OPTIONS" and request.url.path not in {"/api/health", "/api/billing/webhook"}:
-        bearer = request.headers.get("authorization", "")
-        supplied = request.headers.get("x-app-token", "")
-        if bearer.lower().startswith("bearer "):
-            supplied = bearer[7:].strip()
-        import secrets
-        if not supplied or not secrets.compare_digest(supplied, APP_ACCESS_TOKEN):
-            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
-    return await call_next(request)
+    """Authenticate Clerk sessions, with the legacy shared token as a fallback."""
+    public_path = request.method == "OPTIONS" or request.url.path in {"/api/health", "/api/billing/webhook"}
+    user_token = _current_user_id.set("default_user")
+    try:
+        if CLERK_JWKS_CLIENT and not public_path:
+            bearer = request.headers.get("authorization", "")
+            if not bearer.lower().startswith("bearer "):
+                return JSONResponse({"detail": "Authentication required"}, status_code=401)
+            try:
+                token = bearer[7:].strip()
+                signing_key = await asyncio.to_thread(CLERK_JWKS_CLIENT.get_signing_key_from_jwt, token)
+                claims = jwt.decode(
+                    token,
+                    signing_key.key,
+                    algorithms=["RS256"],
+                    issuer=CLERK_ISSUER or None,
+                    audience=CLERK_AUDIENCE,
+                    options={"verify_aud": bool(CLERK_AUDIENCE), "verify_iss": bool(CLERK_ISSUER)},
+                )
+                subject = str(claims.get("sub") or "").strip()
+                if not subject:
+                    raise ValueError("Missing subject claim")
+                _current_user_id.set(subject)
+            except Exception:
+                logger.warning("Rejected invalid Clerk session", exc_info=True)
+                return JSONResponse({"detail": "Invalid authentication token"}, status_code=401)
+        elif APP_ACCESS_TOKEN and not public_path:
+            bearer = request.headers.get("authorization", "")
+            supplied = request.headers.get("x-app-token", "")
+            if bearer.lower().startswith("bearer "):
+                supplied = bearer[7:].strip()
+            import secrets
+            if not supplied or not secrets.compare_digest(supplied, APP_ACCESS_TOKEN):
+                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        return await call_next(request)
+    finally:
+        _current_user_id.reset(user_token)
 
 
 # ---------- KEY MANAGEMENT ----------
@@ -164,7 +208,7 @@ def _dec(v: str) -> str:
 
 
 async def get_keys() -> Dict[str, str]:
-    doc = await db.settings.find_one({"user_id": USER_ID})
+    doc = await db.settings.find_one({"user_id": current_user_id()})
     if not doc:
         return {}
     encrypted = doc.get("keys", {})
@@ -178,13 +222,13 @@ async def get_keys() -> Dict[str, str]:
 
 
 async def save_keys(new_keys: Dict[str, str]) -> None:
-    existing = await db.settings.find_one({"user_id": USER_ID}) or {}
+    existing = await db.settings.find_one({"user_id": current_user_id()}) or {}
     encrypted = existing.get("keys", {})
     for k, v in new_keys.items():
         if v and v.strip() and not v.startswith("***"):
             encrypted[k] = _enc(v.strip())
     await db.settings.update_one(
-        {"user_id": USER_ID},
+        {"user_id": current_user_id()},
         {"$set": {"keys": encrypted, "updated_at": datetime.now(timezone.utc).isoformat()}},
         upsert=True,
     )
@@ -223,7 +267,7 @@ async def _apply_stripe_subscription(subscription: Any, customer_id: Optional[st
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.settings.update_one(
-        {"user_id": USER_ID},
+        {"user_id": current_user_id()},
         {"$set": {"billing_subscription": record}},
         upsert=True,
     )
@@ -252,7 +296,7 @@ async def seed_keys_from_env():
 @app.on_event("startup")
 async def restore_stripe_subscription():
     """Restore a paid workspace plan after a container restart."""
-    settings = await db.settings.find_one({"user_id": USER_ID}) or {}
+    settings = await db.settings.find_one({"user_id": current_user_id()}) or {}
     subscription = settings.get("billing_subscription") or {}
     if subscription.get("status") in {"active", "trialing"} and subscription.get("plan") in {"basic", "pro", "elite"}:
         os.environ["SUBSCRIPTION_PLAN"] = subscription["plan"]
@@ -346,7 +390,7 @@ class TrainingProfileBody(BaseModel):
 # ---------- HELPERS ----------
 async def update_project(pid: str, **fields) -> None:
     fields["updated_at"] = datetime.now(timezone.utc).isoformat()
-    await db.projects.update_one({"id": pid}, {"$set": fields})
+    await db.projects.update_one({"id": pid, "user_id": current_user_id()}, {"$set": fields})
 
 
 def _matched_count(result: Any) -> int:
@@ -358,14 +402,98 @@ def _matched_count(result: Any) -> int:
 async def transition_project_status(pid: str, blocked_statuses: set[str], **fields) -> bool:
     fields["updated_at"] = datetime.now(timezone.utc).isoformat()
     result = await db.projects.update_one(
-        {"id": pid, "status": {"$nin": list(blocked_statuses)}},
+        {"id": pid, "user_id": current_user_id(), "status": {"$nin": list(blocked_statuses)}},
         {"$set": fields},
     )
     return _matched_count(result) > 0
 
 
+class JobLeaseLost(RuntimeError):
+    pass
+
+
+def _job_lease_fields(lease_id: str, kind: str) -> Dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    return {
+        "job_lease_id": lease_id,
+        "job_lease_kind": kind,
+        "job_lease_heartbeat_at": now.isoformat(),
+        "job_lease_expires_at": (now + timedelta(seconds=JOB_LEASE_SECONDS)).isoformat(),
+    }
+
+
+async def _claim_project_job(pid: str, kind: str, status: str, **fields) -> Optional[str]:
+    lease_id = uuid.uuid4().hex
+    claimed = await transition_project_status(
+        pid,
+        blocked_statuses=ACTIVE_JOB_STATUSES,
+        status=status,
+        **fields,
+        **_job_lease_fields(lease_id, kind),
+    )
+    return lease_id if claimed else None
+
+
+async def _ensure_job_lease(pid: str, kind: str, queued_status: str, lease_id: Optional[str]) -> str:
+    if lease_id:
+        return lease_id
+    claimed = await _claim_project_job(pid, kind, queued_status)
+    if not claimed:
+        raise JobLeaseLost(f"Could not acquire {kind} lease for project {pid}")
+    return claimed
+
+
+async def _update_leased_project(pid: str, lease_id: str, *, terminal: bool = False, **fields) -> None:
+    now = datetime.now(timezone.utc)
+    fields["updated_at"] = now.isoformat()
+    if terminal:
+        fields.update({
+            "job_lease_id": None,
+            "job_lease_kind": None,
+            "job_lease_heartbeat_at": None,
+            "job_lease_expires_at": None,
+        })
+    else:
+        fields.update({
+            "job_lease_heartbeat_at": now.isoformat(),
+            "job_lease_expires_at": (now + timedelta(seconds=JOB_LEASE_SECONDS)).isoformat(),
+        })
+    result = await db.projects.update_one(
+        {"id": pid, "job_lease_id": lease_id},
+        {"$set": fields},
+    )
+    if _matched_count(result) == 0:
+        raise JobLeaseLost(f"{pid} is no longer owned by lease {lease_id}")
+
+
+async def _job_lease_heartbeat(pid: str, lease_id: str) -> None:
+    while True:
+        await asyncio.sleep(JOB_HEARTBEAT_SECONDS)
+        now = datetime.now(timezone.utc)
+        result = await db.projects.update_one(
+            {"id": pid, "job_lease_id": lease_id},
+            {"$set": {
+                "job_lease_heartbeat_at": now.isoformat(),
+                "job_lease_expires_at": (now + timedelta(seconds=JOB_LEASE_SECONDS)).isoformat(),
+                "updated_at": now.isoformat(),
+            }},
+        )
+        if _matched_count(result) == 0:
+            return
+
+
+async def _stop_job_heartbeat(task: Optional[asyncio.Task]) -> None:
+    if not task:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
 async def get_project(pid: str) -> Dict:
-    doc = await db.projects.find_one({"id": pid}, {"_id": 0})
+    doc = await db.projects.find_one({"id": pid, "user_id": current_user_id()}, {"_id": 0})
     if not doc:
         raise HTTPException(404, "Project not found")
     return doc
@@ -400,11 +528,82 @@ def _parse_project_expiry(value: Any) -> Optional[datetime]:
         return None
 
 
+def _job_kind_for_status(status: str) -> Optional[str]:
+    if status in ANALYSIS_ACTIVE_STATUSES:
+        return "analysis"
+    if status in RENDER_ACTIVE_STATUSES:
+        return "render"
+    return None
+
+
+def _job_lease_is_stale(project: Dict[str, Any], now: Optional[datetime] = None) -> bool:
+    if project.get("status") not in ACTIVE_JOB_STATUSES:
+        return False
+    now = now or datetime.now(timezone.utc)
+    if not project.get("job_lease_id"):
+        last_update = _parse_project_expiry(project.get("updated_at"))
+        return last_update is None or last_update <= now - timedelta(seconds=JOB_LEASE_SECONDS)
+    expires_at = _parse_project_expiry(project.get("job_lease_expires_at"))
+    return expires_at is None or expires_at <= now
+
+
+async def _recover_stale_project(project: Dict[str, Any], now: Optional[datetime] = None) -> bool:
+    now = now or datetime.now(timezone.utc)
+    if not _job_lease_is_stale(project, now):
+        return False
+    kind = _job_kind_for_status(str(project.get("status") or "")) or "job"
+    observed_expiry = project.get("job_lease_expires_at")
+    result = await db.projects.update_one(
+        {
+            "id": project["id"],
+            "status": project.get("status"),
+            "job_lease_id": project.get("job_lease_id"),
+            "job_lease_expires_at": observed_expiry,
+        },
+        {"$set": {
+            "status": "error",
+            "status_message": f"Previous {kind} was interrupted. Retry to continue.",
+            "job_lease_id": None,
+            "job_lease_kind": None,
+            "job_lease_heartbeat_at": None,
+            "job_lease_expires_at": None,
+            "job_recovered_at": now.isoformat(),
+            "job_recovery_reason": "stale_lease",
+            "updated_at": now.isoformat(),
+        }},
+    )
+    return _matched_count(result) > 0
+
+
+async def recover_stale_jobs() -> int:
+    now = datetime.now(timezone.utc)
+    projects = await db.projects.find({}, {"_id": 0}).to_list(10000)
+    recovered = 0
+    for project in projects:
+        if await _recover_stale_project(project, now):
+            recovered += 1
+    if recovered:
+        logger.warning("Recovered %s stale analysis/render job(s)", recovered)
+    return recovered
+
+
+async def _refresh_active_project(project: Dict[str, Any]) -> Dict[str, Any]:
+    if project.get("status") in ACTIVE_JOB_STATUSES and _job_lease_is_stale(project):
+        await _recover_stale_project(project)
+        return await get_project(project["id"])
+    return project
+
+
+@app.on_event("startup")
+async def recover_stale_jobs_on_startup():
+    await recover_stale_jobs()
+
+
 async def purge_expired_projects() -> int:
     """Delete expired projects and migrate older records to the current plan policy."""
     now = datetime.now(timezone.utc)
     removed = 0
-    projects = await db.projects.find({"user_id": USER_ID}, {"_id": 0}).to_list(10000)
+    projects = await db.projects.find({"user_id": current_user_id()}, {"_id": 0}).to_list(10000)
     for project in projects:
         plan = project.get("subscription_plan") or subscription_plan()
         if plan not in PLAN_POLICIES:
@@ -432,7 +631,7 @@ async def reconcile_project_retention(plan: str) -> None:
         plan = "basic"
     days = PLAN_POLICIES[plan]["retention_days"]
     now = datetime.now(timezone.utc)
-    projects = await db.projects.find({"user_id": USER_ID}, {"_id": 0}).to_list(10000)
+    projects = await db.projects.find({"user_id": current_user_id()}, {"_id": 0}).to_list(10000)
     for project in projects:
         created_at = _parse_project_expiry(project.get("created_at")) or now
         expires_at = created_at + timedelta(days=days) if days is not None else None
@@ -462,13 +661,21 @@ async def start_retention_sweeper():
     app.state.retention_task = asyncio.create_task(_retention_sweeper())
 
 
-async def _compress_project_source(pid: str, proj: Dict[str, Any]) -> Dict[str, Any]:
+async def _compress_project_source(
+    pid: str, proj: Dict[str, Any], lease_id: Optional[str] = None,
+) -> Dict[str, Any]:
     """Replace a large upload with a smaller working source when it saves space."""
+    async def persist(**fields) -> None:
+        if lease_id:
+            await _update_leased_project(pid, lease_id, **fields)
+        else:
+            await update_project(pid, **fields)
+
     if not COMPRESS_UPLOADS or proj.get("source_optimized"):
         return proj
     source = Path(proj.get("original_path") or "")
     if not source.is_file() or source.stat().st_size < UPLOAD_COMPRESSION_MIN_BYTES:
-        await update_project(pid, source_optimized=True)
+        await persist(source_optimized=True)
         return proj
 
     original_size = source.stat().st_size
@@ -482,8 +689,9 @@ async def _compress_project_source(pid: str, proj: Dict[str, Any]) -> Dict[str, 
         compressed_size = candidate.stat().st_size
         if compressed_size >= original_size * 0.95:
             candidate.unlink(missing_ok=True)
-            await update_project(pid, source_optimized=True)
+            await persist(source_optimized=True)
             return proj
+        await persist()
         os.replace(candidate, final_path)
         if source != final_path:
             source.unlink(missing_ok=True)
@@ -498,12 +706,15 @@ async def _compress_project_source(pid: str, proj: Dict[str, Any]) -> Dict[str, 
             "source_size_bytes": original_size,
             "storage_saved_bytes": original_size - compressed_size,
         }
-        await update_project(pid, **fields)
+        await persist(**fields)
         return {**proj, **fields}
+    except JobLeaseLost:
+        candidate.unlink(missing_ok=True)
+        raise
     except Exception:
         candidate.unlink(missing_ok=True)
         logger.exception("Upload compression failed for project %s; keeping original", pid)
-        await update_project(pid, source_optimized=True)
+        await persist(source_optimized=True)
         return proj
 
 
@@ -553,7 +764,7 @@ def _canonical_training_url(value: Optional[str]) -> Optional[str]:
 async def _training_context(profile_id: Optional[str]) -> tuple[Optional[Dict[str, Any]], str]:
     if not profile_id:
         return None, ""
-    profile = await db.training_profiles.find_one({"id": profile_id, "user_id": USER_ID}, {"_id": 0})
+    profile = await db.training_profiles.find_one({"id": profile_id, "user_id": current_user_id()}, {"_id": 0})
     if not profile:
         raise HTTPException(404, "Training profile not found")
     if profile.get("status") != "active":
@@ -594,6 +805,19 @@ def _safe_data_file(candidate: str) -> Optional[str]:
         if not path.is_file() or not path.is_relative_to(root):
             return None
         return str(path)
+    except (OSError, RuntimeError):
+        return None
+
+
+def _safe_music_file(candidate: str) -> Optional[str]:
+    """Resolve only uploaded project music, never another file under DATA_DIR."""
+    safe = _safe_data_file(candidate)
+    if not safe:
+        return None
+    try:
+        path = Path(safe)
+        music_root = (DATA_DIR / "music").resolve(strict=True)
+        return safe if path.is_relative_to(music_root) else None
     except (OSError, RuntimeError):
         return None
 
@@ -644,7 +868,7 @@ async def subscription_status():
     """Return the plan applied by the trusted billing/admin system."""
     plan = subscription_plan()
     policy = PLAN_POLICIES[plan]
-    settings = await db.settings.find_one({"user_id": USER_ID}) or {}
+    settings = await db.settings.find_one({"user_id": current_user_id()}) or {}
     billing_subscription = settings.get("billing_subscription") or {}
     return {
         "plan": plan,
@@ -661,7 +885,7 @@ async def subscription_status():
 async def create_checkout(body: CheckoutBody):
     if not STRIPE_SECRET_KEY:
         raise HTTPException(503, "Billing is not configured")
-    settings = await db.settings.find_one({"user_id": USER_ID}) or {}
+    settings = await db.settings.find_one({"user_id": current_user_id()}) or {}
     billing_subscription = settings.get("billing_subscription") or {}
     if billing_subscription.get("customer_id") and billing_subscription.get("status") in {"active", "trialing", "past_due"}:
         raise HTTPException(409, "This workspace already has an active Stripe subscription. Use billing management instead.")
@@ -675,8 +899,8 @@ async def create_checkout(body: CheckoutBody):
             allow_promotion_codes=True,
             success_url=f"{FRONTEND_URL}/pricing?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{FRONTEND_URL}/pricing?checkout=cancelled",
-            metadata={"workspace_id": USER_ID, "plan": body.plan},
-            subscription_data={"metadata": {"workspace_id": USER_ID, "plan": body.plan}},
+            metadata={"workspace_id": current_user_id(), "plan": body.plan},
+            subscription_data={"metadata": {"workspace_id": current_user_id(), "plan": body.plan}},
         )
     except stripe.StripeError:
         logger.exception("Could not create Stripe Checkout session")
@@ -688,7 +912,7 @@ async def create_checkout(body: CheckoutBody):
 async def create_billing_portal():
     if not STRIPE_SECRET_KEY:
         raise HTTPException(503, "Billing is not configured")
-    settings = await db.settings.find_one({"user_id": USER_ID}) or {}
+    settings = await db.settings.find_one({"user_id": current_user_id()}) or {}
     customer_id = str((settings.get("billing_subscription") or {}).get("customer_id") or "")
     if not customer_id:
         raise HTTPException(404, "No Stripe subscription is attached to this workspace")
@@ -726,7 +950,7 @@ async def stripe_webhook(request: Request):
 # ---------- TRAINING LAB ----------
 @api.get("/training/dashboard")
 async def training_dashboard():
-    references = await db.training_references.find({"user_id": USER_ID}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    references = await db.training_references.find({"user_id": current_user_id()}, {"_id": 0}).sort("created_at", -1).to_list(100)
     unique_references = []
     seen_reference_urls = set()
     for reference in references:
@@ -737,7 +961,7 @@ async def training_dashboard():
             seen_reference_urls.add(canonical_url)
             reference = {**reference, "source_url": canonical_url}
         unique_references.append(reference)
-    profiles = await db.training_profiles.find({"user_id": USER_ID}, {"_id": 0}).sort("updated_at", -1).to_list(100)
+    profiles = await db.training_profiles.find({"user_id": current_user_id()}, {"_id": 0}).sort("updated_at", -1).to_list(100)
     return {
         "policy": "References are editorial research and annotations, not uploaded creator footage or model fine-tuning data.",
         "references": unique_references,
@@ -763,12 +987,12 @@ async def _create_training_reference_locked(body: TrainingReferenceBody):
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise HTTPException(400, "Reference link must be a valid http(s) URL")
         source_url = _canonical_training_url(source_url)
-        existing_references = await db.training_references.find({"user_id": USER_ID}, {"_id": 0}).to_list(1000)
+        existing_references = await db.training_references.find({"user_id": current_user_id()}, {"_id": 0}).to_list(1000)
         if any(_canonical_training_url(item.get("source_url")) == source_url for item in existing_references):
             raise HTTPException(409, "A training reference for this URL already exists")
     principles = _clean_training_principles(body.principles)
     record = {
-        "id": f"ref_{uuid.uuid4().hex[:12]}", "user_id": USER_ID,
+        "id": f"ref_{uuid.uuid4().hex[:12]}", "user_id": current_user_id(),
         "title": body.title.strip(), "source_url": source_url,
         "niche": body.niche.strip().lower(), "game": body.game.strip() if body.game else None,
         "rights_status": body.rights_status, "notes": body.notes.strip(), "principles": principles,
@@ -784,7 +1008,7 @@ async def create_training_profile(body: TrainingProfileBody):
     reference_ids = list(dict.fromkeys(body.reference_ids))
     valid_references = []
     for ref_id in reference_ids:
-        reference = await db.training_references.find_one({"id": ref_id, "user_id": USER_ID}, {"_id": 0})
+        reference = await db.training_references.find_one({"id": ref_id, "user_id": current_user_id()}, {"_id": 0})
         if not reference:
             raise HTTPException(400, "One or more selected references no longer exist")
         valid_references.append(reference)
@@ -797,7 +1021,7 @@ async def create_training_profile(body: TrainingProfileBody):
     if not principles:
         raise HTTPException(400, "Add at least one usable editorial principle")
     record = {
-        "id": f"profile_{uuid.uuid4().hex[:12]}", "user_id": USER_ID,
+        "id": f"profile_{uuid.uuid4().hex[:12]}", "user_id": current_user_id(),
         "name": body.name.strip(), "niche": body.niche.strip().lower(), "game": body.game.strip() if body.game else None,
         "base_profile": body.base_profile, "reference_ids": reference_ids, "principles": principles,
         "reference_count": len(valid_references), "status": "draft",
@@ -809,12 +1033,12 @@ async def create_training_profile(body: TrainingProfileBody):
 
 @api.post("/training/profiles/{profile_id}/activate")
 async def activate_training_profile(profile_id: str):
-    profile = await db.training_profiles.find_one({"id": profile_id, "user_id": USER_ID}, {"_id": 0})
+    profile = await db.training_profiles.find_one({"id": profile_id, "user_id": current_user_id()}, {"_id": 0})
     if not profile:
         raise HTTPException(404, "Training profile not found")
     if len(profile.get("principles", [])) < 3:
         raise HTTPException(400, "Add at least 3 approved principles before activation")
-    await db.training_profiles.update_one({"id": profile_id, "user_id": USER_ID}, {"$set": {
+    await db.training_profiles.update_one({"id": profile_id, "user_id": current_user_id()}, {"$set": {
         "status": "active", "activated_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }})
@@ -843,7 +1067,7 @@ async def upload_project(file: UploadFile = File(...)):
     plan, expires_at = project_retention()
     project = {
         "id": pid,
-        "user_id": USER_ID,
+        "user_id": current_user_id(),
         "name": file.filename or f"Project-{pid[:8]}",
         "status": "uploaded",
         "status_message": "Uploaded, ready to analyze",
@@ -872,7 +1096,7 @@ async def upload_project(file: UploadFile = File(...)):
 @api.get("/projects")
 async def list_projects():
     items = await db.projects.find(
-        {"user_id": USER_ID},
+        {"user_id": current_user_id()},
         {"_id": 0, "transcript.words": 0, "transcript.segments": 0},
     ).sort("created_at", -1).to_list(100)
     return items
@@ -1029,7 +1253,7 @@ async def upload_finalize(upload_id: str):
     plan, expires_at = project_retention()
     project = {
         "id": pid,
-        "user_id": USER_ID,
+        "user_id": current_user_id(),
         "name": m.get("filename") or f"Project-{pid[:8]}",
         "status": "uploaded",
         "status_message": "Uploaded, ready to analyze",
@@ -1079,36 +1303,41 @@ async def delete_project(pid: str):
 
 
 # ---------- ANALYZE PIPELINE ----------
-async def _run_analysis(pid: str):
+async def _run_analysis(pid: str, lease_id: Optional[str] = None):
+    heartbeat = None
     try:
+        lease_id = await _ensure_job_lease(pid, "analysis", "queued", lease_id)
+        heartbeat = asyncio.create_task(_job_lease_heartbeat(pid, lease_id))
         keys = await get_keys()
         if not keys.get("groq"):
-            await update_project(pid, status="error",
-                                 status_message="The AI service is not configured. Please try again later.")
+            await _update_leased_project(
+                pid, lease_id, terminal=True, status="error",
+                status_message="The AI service is not configured. Please try again later.",
+            )
             return
 
         proj = await get_project(pid)
         if COMPRESS_UPLOADS and not proj.get("source_optimized"):
-            await update_project(pid, status="extracting_audio", progress=2,
-                                 status_message="Optimizing upload storage...")
-            proj = await _compress_project_source(pid, proj)
-        await update_project(pid, status="extracting_audio", progress=5,
-                             status_message="Extracting audio...")
+            await _update_leased_project(pid, lease_id, status="extracting_audio", progress=2,
+                                         status_message="Optimizing upload storage...")
+            proj = await _compress_project_source(pid, proj, lease_id)
+        await _update_leased_project(pid, lease_id, status="extracting_audio", progress=5,
+                                     status_message="Extracting audio...")
 
         audio_path = str(DATA_DIR / "audio" / f"{pid}.mp3")
         await asyncio.to_thread(vp.extract_audio, proj["original_path"], audio_path)
-        await update_project(pid, audio_path=audio_path, progress=15,
-                             status="transcribing",
-                             status_message="Transcribing with Whisper (Groq)...")
+        await _update_leased_project(pid, lease_id, audio_path=audio_path, progress=15,
+                                     status="transcribing",
+                                     status_message="Transcribing with Whisper (Groq)...")
 
         try:
             transcript = await ai.transcribe_audio(audio_path, keys["groq"])
         finally:
             Path(audio_path).unlink(missing_ok=True)
-            await update_project(pid, audio_path=None)
-        await update_project(pid, transcript=transcript, progress=55,
-                             status="analyzing",
-                             status_message="AI analyzing for fillers, emphasis, B-roll...")
+            await _update_leased_project(pid, lease_id, audio_path=None)
+        await _update_leased_project(pid, lease_id, transcript=transcript, progress=55,
+                                     status="analyzing",
+                                     status_message="AI analyzing for fillers, emphasis, B-roll...")
 
         # A selected Training Lab profile is an explicit user choice. Otherwise
         # retain per-project niche inference instead of applying a global style.
@@ -1135,8 +1364,10 @@ async def _run_analysis(pid: str):
                 if isinstance(issue, dict) and issue.get("code")
             ]
             summary = ", ".join(issue_codes[:3]) or "semantic quality threshold not met"
-            await update_project(
+            await _update_leased_project(
                 pid,
+                lease_id,
+                terminal=True,
                 analysis=analysis,
                 progress=100,
                 status="error",
@@ -1146,8 +1377,8 @@ async def _run_analysis(pid: str):
                 ),
             )
             return
-        await update_project(pid, progress=82,
-                             status_message="Building the edit plan and missing graphics...")
+        await _update_leased_project(pid, lease_id, progress=82,
+                                     status_message="Building the edit plan and missing graphics...")
         pack_resolution = await ASSET_ORCHESTRATOR.resolve(
             quality_review.get("profile", "general"),
             [
@@ -1233,31 +1464,41 @@ async def _run_analysis(pid: str):
                     "visual_intent": "Clarify the idea without unrelated stock footage.",
                 })
                 existing_indices.add(asset["word_index"])
-        await update_project(pid, analysis=analysis, progress=100, status="ready",
-                             status_message="Ready to edit & render")
+        await _update_leased_project(pid, lease_id, terminal=True, analysis=analysis,
+                                     progress=100, status="ready",
+                                     status_message="Ready to edit & render")
+    except JobLeaseLost:
+        logger.info("Analysis lease lost for project %s; stopping state updates", pid)
     except Exception as e:
         logger.exception("Analysis failed")
-        await update_project(pid, status="error", status_message=f"Analysis failed: {e}")
+        if lease_id:
+            try:
+                await _update_leased_project(
+                    pid, lease_id, terminal=True, status="error",
+                    status_message=f"Analysis failed: {e}",
+                )
+            except JobLeaseLost:
+                logger.info("Analysis failure ignored after lease loss for project %s", pid)
+    finally:
+        await _stop_job_heartbeat(heartbeat)
 
 
 @api.post("/projects/{pid}/analyze")
 async def analyze(pid: str, bg: BackgroundTasks, body: Optional[AnalyzeBody] = None):
-    proj = await get_project(pid)
-    active_statuses = {"queued", "extracting_audio", "transcribing", "analyzing", "queued_render", "rendering"}
-    if proj["status"] in active_statuses:
+    proj = await _refresh_active_project(await get_project(pid))
+    if proj["status"] in ACTIVE_JOB_STATUSES:
         return {"ok": True, "status": proj["status"], "already_running": True}
     body = body or AnalyzeBody()
     if body.training_profile_id:
         await _training_context(body.training_profile_id)
-    queued = await transition_project_status(
-        pid, status="queued", status_message="Queued for analysis...", progress=1,
+    lease_id = await _claim_project_job(
+        pid, kind="analysis", status="queued", status_message="Queued for analysis...", progress=1,
         requested_profile=body.requested_profile, training_profile_id=body.training_profile_id,
-        blocked_statuses=active_statuses,
     )
-    if not queued:
+    if not lease_id:
         latest = await get_project(pid)
         return {"ok": True, "status": latest.get("status"), "already_running": True}
-    bg.add_task(_run_analysis, pid)
+    bg.add_task(_run_analysis, pid, lease_id)
     return {"ok": True, "status": "queued"}
 
 
@@ -1507,17 +1748,59 @@ async def music_upload(
     dst = DATA_DIR / "music" / f"{pid}_{uuid.uuid4().hex[:10]}{ext}"
     await _save_upload(file, dst, MAX_ASSET_BYTES)
     try:
-        meta = vp.probe_audio(str(dst))
+        meta = vp.probe_audio(str(dst), expected_extension=ext)
     except Exception as exc:
         dst.unlink(missing_ok=True)
         raise HTTPException(400, f"Could not read music file: {str(exc)[:200]}") from exc
-    previous = (await get_project(pid)).get("background_music_path")
-    await update_project(pid, background_music_path=str(dst), background_music_name=file.filename or dst.name)
+    current = await get_project(pid)
+    previous = current.get("background_music_path")
+    edit_options = dict(current.get("edit_options") or {})
+    edit_options["background_music"] = True
+    await update_project(
+        pid,
+        background_music_path=str(dst),
+        background_music_name=file.filename or dst.name,
+        edit_options=edit_options,
+    )
     if previous and previous != str(dst):
-        safe_previous = _safe_data_file(previous)
+        safe_previous = _safe_music_file(previous)
         if safe_previous:
             Path(safe_previous).unlink(missing_ok=True)
     return {"ok": True, "name": file.filename or dst.name, "duration": meta.get("duration", 0), "volume": 0.16}
+
+
+@api.delete("/projects/{pid}/music")
+async def music_detach(pid: str):
+    """Detach the currently attached music bed and remove its uploaded file."""
+    project = await get_project(pid)
+    attached_path = project.get("background_music_path")
+    edit_options = dict(project.get("edit_options") or {})
+    edit_options["background_music"] = False
+    fields = {
+        "background_music_path": None,
+        "background_music_name": None,
+        "edit_options": edit_options,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    result = await db.projects.update_one(
+        {
+            "id": pid,
+            "background_music_path": attached_path,
+            "edit_options": project.get("edit_options"),
+        },
+        {"$set": fields},
+    )
+    if _matched_count(result) == 0:
+        raise HTTPException(409, "The music attachment changed; reload before detaching")
+
+    safe_music = _safe_music_file(attached_path or "")
+    if safe_music:
+        try:
+            Path(safe_music).unlink(missing_ok=True)
+        except OSError as exc:
+            logger.exception("Could not remove detached music for project %s", pid)
+            raise HTTPException(500, "Music was detached but its file could not be removed") from exc
+    return {"ok": True, "background_music_name": None, "background_music": False}
 
 
 # ---------- VIRAL CLIPS ----------
@@ -1543,11 +1826,14 @@ async def viral_clips(pid: str):
 
 
 # ---------- RENDER PIPELINE ----------
-async def _run_render(pid: str, opts: RenderOptions):
+async def _run_render(pid: str, opts: RenderOptions, lease_id: Optional[str] = None):
+    heartbeat = None
     try:
+        lease_id = await _ensure_job_lease(pid, "render", "queued_render", lease_id)
+        heartbeat = asyncio.create_task(_job_lease_heartbeat(pid, lease_id))
         proj = await get_project(pid)
-        await update_project(pid, status="rendering", progress=5,
-                             status_message="Preparing render...", render_options=opts.model_dump())
+        await _update_leased_project(pid, lease_id, status="rendering", progress=5,
+                                     status_message="Preparing render...", render_options=opts.model_dump())
 
         transcript = proj.get("transcript") or {}
         words = transcript.get("words", [])
@@ -1585,12 +1871,13 @@ async def _run_render(pid: str, opts: RenderOptions):
                     trimmed.append({"start": s, "end": e})
             keep = trimmed or [{"start": clip_start, "end": clip_end}]
 
-        await update_project(pid, progress=15, status_message="Cutting segments...")
+        await _update_leased_project(pid, lease_id, progress=15, status_message="Cutting segments...")
 
         cut_path = str(DATA_DIR / "output" / f"{pid}_cut.mp4")
         await asyncio.to_thread(vp.cut_and_concat, proj["original_path"], keep, cut_path,
                                 out_w, out_h, src_w, src_h, None, None)
-        await update_project(pid, progress=45, status_message="Generating animated captions...")
+        await _update_leased_project(pid, lease_id, progress=45,
+                                     status_message="Generating animated captions...")
 
         # Build ASS captions
         ass_path = None
@@ -1611,7 +1898,8 @@ async def _run_render(pid: str, opts: RenderOptions):
         # B-roll events: user-selected
         broll_events = []
         if opts.broll and opts.selected_broll:
-            await update_project(pid, progress=55, status_message="Downloading B-roll clips...")
+            await _update_leased_project(pid, lease_id, progress=55,
+                                         status_message="Downloading B-roll clips...")
             for i, sel in enumerate(opts.selected_broll):
                 url = sel.get("video_url") or ""
                 moment_word_idx = int(sel.get("word_index", 0))
@@ -1655,7 +1943,8 @@ async def _run_render(pid: str, opts: RenderOptions):
                     ),
                 })
 
-        await update_project(pid, progress=70, status_message="Rendering final video...")
+        await _update_leased_project(pid, lease_id, progress=70,
+                                     status_message="Rendering final video...")
 
         # Choose output filename — separate for viral clips so main render is preserved
         if opts.clip_label:
@@ -1690,9 +1979,14 @@ async def _run_render(pid: str, opts: RenderOptions):
             )
         except Exception as exc:
             render_review = {"schema_version": "klippd.post_render_qa.v1", "passed": False, "hard_fail": True, "issues": [{"code": "review_failed", "detail": str(exc)[:200]}]}
+        hard_qa_failure = render_review.get("hard_fail") is True
         update_fields = {"status": "done", "progress": 100,
-                         "status_message": "Render complete!", "output_meta": output_meta,
+                         "status_message": (
+                             "Render complete, but hard QA failures block download until reviewed."
+                             if hard_qa_failure else "Render complete!"
+                         ), "output_meta": output_meta,
                          "post_render_qa": render_review,
+                         "post_render_qa_acknowledgment": None,
                          "render_review_required": not bool(render_review.get("passed"))}
         if opts.clip_label:
             # Track in viral_renders dict on project
@@ -1701,35 +1995,57 @@ async def _run_render(pid: str, opts: RenderOptions):
             vr[opts.clip_label] = output_path
             update_fields["viral_renders"] = vr
             update_fields["last_clip_label"] = opts.clip_label
+            if (
+                opts.clip_label.startswith("range_")
+                and opts.clip_start is not None
+                and opts.clip_end is not None
+            ):
+                update_fields["focused_render"] = {
+                    "label": opts.clip_label,
+                    "start": opts.clip_start,
+                    "end": opts.clip_end,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                }
         else:
             update_fields["output_path"] = output_path
-        await update_project(pid, **update_fields)
+            update_fields["last_clip_label"] = None
+        await _update_leased_project(pid, lease_id, terminal=True, **update_fields)
+    except JobLeaseLost:
+        logger.info("Render lease lost for project %s; stopping state updates", pid)
     except Exception as e:
         logger.exception("Render failed")
-        await update_project(pid, status="error", status_message=f"Render failed: {e}")
+        if lease_id:
+            try:
+                await _update_leased_project(
+                    pid, lease_id, terminal=True, status="error",
+                    status_message=f"Render failed: {e}",
+                )
+            except JobLeaseLost:
+                logger.info("Render failure ignored after lease loss for project %s", pid)
+    finally:
+        await _stop_job_heartbeat(heartbeat)
 
 
 @api.post("/projects/{pid}/render")
 async def render(pid: str, opts: RenderOptions, bg: BackgroundTasks):
-    proj = await get_project(pid)
+    proj = await _refresh_active_project(await get_project(pid))
     if not proj.get("transcript"):
         raise HTTPException(400, "Project not analyzed yet")
-    active_statuses = {"queued", "extracting_audio", "transcribing", "analyzing", "queued_render", "rendering"}
-    if proj.get("status") in active_statuses:
+    if proj.get("status") in ACTIVE_JOB_STATUSES:
         return {"ok": True, "status": proj["status"], "already_running": True}
     if opts.clip_end is not None and opts.clip_end > float(proj.get("duration") or 0) + 0.1:
         raise HTTPException(400, "Clip end exceeds the source duration")
-    queued = await transition_project_status(
+    lease_id = await _claim_project_job(
         pid,
-        blocked_statuses=active_statuses,
+        kind="render",
         status="queued_render",
         status_message="Render queued...",
         progress=1,
     )
-    if not queued:
+    if not lease_id:
         latest = await get_project(pid)
         return {"ok": True, "status": latest.get("status"), "already_running": True}
-    bg.add_task(_run_render, pid, opts)
+    bg.add_task(_run_render, pid, opts, lease_id)
     return {"ok": True, "status": "queued_render"}
 
 
@@ -1745,6 +2061,14 @@ def _clean_filename(name: str) -> str:
 async def download_final(pid: str, clip: Optional[str] = None):
     """Download the main render, or a viral clip if ?clip=<label> is given."""
     proj = await get_project(pid)
+    if post_render_hard_failure_blocked(proj):
+        review = proj.get("post_render_qa") or {}
+        raise HTTPException(status_code=409, detail={
+            "code": "post_render_qa_hard_failure",
+            "message": "Download is blocked by hard post-render QA failures. Fix them or explicitly acknowledge the current QA review.",
+            "issues": review.get("issues") or [],
+            "acknowledgment_endpoint": f"/api/projects/{pid}/post-render-qa/acknowledge",
+        })
     base = _clean_filename(proj.get("name") or "video")
     if clip:
         out = (proj.get("viral_renders") or {}).get(clip)
@@ -1779,7 +2103,7 @@ async def media_output(pid: str):
 
 
 # ---------- APP WIRING ----------
-register_premium_routes(api, db, USER_ID, get_project, update_project, require_plan)
+register_premium_routes(api, db, current_user_id, get_project, update_project, require_plan)
 app.include_router(api)
 cors_origins = [origin.strip() for origin in os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",") if origin.strip()]
 app.add_middleware(

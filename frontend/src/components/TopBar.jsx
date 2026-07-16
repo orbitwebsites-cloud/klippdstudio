@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
 import { useState } from "react";
 import { BrainCircuit, CreditCard, FolderOpen, Menu, Settings, Sparkles, WifiOff, X } from "lucide-react";
+import { SignInButton, SignUpButton, Show, UserButton } from "@clerk/react";
 
 const NAV_ITEMS = [
     { to: "/library", label: "Library", icon: FolderOpen },
@@ -9,7 +10,7 @@ const NAV_ITEMS = [
     { to: "/settings", label: "Settings", icon: Settings },
 ];
 
-export default function TopBar({ backendOnline }) {
+export default function TopBar({ backendOnline, authEnabled = false }) {
     const [open, setOpen] = useState(false);
 
     return (
@@ -51,6 +52,13 @@ export default function TopBar({ backendOnline }) {
                             <WifiOff className="w-3.5 h-3.5" /> SERVER OFFLINE
                         </div>
                     )}
+                    {authEnabled && <div className="hidden sm:flex items-center gap-2">
+                        <Show when="signed-out">
+                            <SignInButton mode="modal"><button type="button" className="btn-ghost !px-3 !py-2 text-[10px]">SIGN IN</button></SignInButton>
+                            <SignUpButton mode="modal"><button type="button" className="btn-brand !px-3 !py-2 text-[10px]">SIGN UP</button></SignUpButton>
+                        </Show>
+                        <Show when="signed-in"><UserButton /></Show>
+                    </div>}
                     <button
                         type="button"
                         className="md:hidden min-w-11 min-h-11 inline-flex items-center justify-center border border-white/10 text-white/70"

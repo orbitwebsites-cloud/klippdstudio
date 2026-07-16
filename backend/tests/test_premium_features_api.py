@@ -1,4 +1,6 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -7,7 +9,7 @@ from local_store import LocalDatabase
 from premium_features import register_premium_routes
 
 
-def _client(tmp_path):
+def _client(tmp_path, project_read_barrier=None):
     db = LocalDatabase(tmp_path / "premium.json")
     project = {
         "id": "owned-project", "user_id": "user", "duration": 60,
@@ -26,6 +28,8 @@ def _client(tmp_path):
         value = await db.projects.find_one({"id": pid}, {"_id": 0})
         if not value:
             raise HTTPException(404, "Project not found")
+        if project_read_barrier is not None:
+            await asyncio.to_thread(project_read_barrier.wait)
         return value
 
     async def update_project(pid, **fields):
@@ -97,15 +101,94 @@ def test_editorial_team_review_is_evidence_backed_and_non_mutating(tmp_path):
     assert after == before
 
 
+def test_editorial_review_prefers_post_render_qa_and_exposes_delivery_block(tmp_path):
+    client, db = _client(tmp_path)
+    asyncio.run(db.projects.update_one({"id": "owned-project"}, {"$set": {
+        "output_path": "/renders/final.mp4",
+        "analysis": {"quality_review": {"passed": True, "issues": []}},
+        "post_render_qa": {
+            "passed": False,
+            "hard_fail": True,
+            "issues": [{"code": "unsafe_captions", "severity": "critical"}],
+        },
+    }}))
+
+    response = client.get("/api/projects/owned-project/editorial-team/review")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "delivery_blocked"
+    assert payload["quality"]["qa_source"] == "post_render_qa"
+    assert payload["quality"]["verdict"] == "blocked_by_post_render_qa"
+    assert "block" in payload["team"][4]["notes"][0]["detail"].lower()
+
+
+def test_hard_post_render_qa_requires_deliberate_acknowledgment(tmp_path):
+    client, db = _client(tmp_path)
+    asyncio.run(db.projects.update_one({"id": "owned-project"}, {"$set": {
+        "output_path": "/renders/final.mp4",
+        "post_render_qa": {
+            "passed": False,
+            "hard_fail": True,
+            "issues": [{"code": "render_corrupt", "severity": "critical"}],
+        },
+        "render_review_required": True,
+    }}))
+
+    endpoint = "/api/projects/owned-project/post-render-qa/acknowledge"
+    assert client.post(endpoint, json={"acknowledge": False, "reason": "I accept the delivery risk"}).status_code == 422
+    assert client.post(endpoint, json={"acknowledge": True, "reason": "too short"}).status_code == 422
+    assert client.post(endpoint, json={"acknowledge": True, "reason": "            "}).status_code == 422
+
+    response = client.post(endpoint, json={
+        "acknowledge": True,
+        "reason": "I reviewed the failed render and accept the delivery risk.",
+    })
+
+    assert response.status_code == 200, response.text
+    assert response.json()["download_allowed"] is True
+    assert response.json()["quality"]["delivery_blocked"] is False
+    project = asyncio.run(db.projects.find_one({"id": "owned-project"}))
+    assert project["post_render_qa_acknowledgment"]["acknowledged"] is True
+    assert project["post_render_qa_acknowledgment"]["reason"].startswith("I reviewed")
+    assert project["render_review_required"] is False
+
+
 def test_edit_versions_save_and_restore_a_snapshot(tmp_path):
     client, db = _client(tmp_path)
-    saved = client.post("/api/projects/owned-project/edit-versions", json={"name": "Before bold pass"})
+    editor_state = {
+        "style": "editorial",
+        "aspect": "9:16",
+        "captions": False,
+        "silence_threshold": 1.1,
+        "excluded_filler_indices": [2, 7],
+        "added_filler_indices": [4],
+        "selected_broll": [{
+            "word_index": 10,
+            "id": "library-clip",
+            "name": "Product close-up",
+            "local_path": "library/product.mp4",
+            "is_custom": True,
+        }],
+        "creator_profile_id": "profile-draft",
+    }
+    saved = client.post("/api/projects/owned-project/edit-versions", json={
+        "name": "Before bold pass",
+        "editor_state": editor_state,
+    })
     assert saved.status_code == 200, saved.text
     version_id = saved.json()["version"]["id"]
-    asyncio.run(db.projects.update_one({"id": "owned-project"}, {"$set": {"analysis": {"changed": True}}}))
+    assert saved.json()["version"]["snapshot"]["edit_options"] == editor_state
+    asyncio.run(db.projects.update_one({"id": "owned-project"}, {"$set": {
+        "analysis": {"changed": True},
+        "edit_options": {"captions": True},
+        "creator_profile_id": "profile-newer",
+    }}))
     restored = client.post(f"/api/projects/owned-project/edit-versions/{version_id}/restore")
     assert restored.status_code == 200, restored.text
     assert restored.json()["project"]["analysis"]["filler_indices"] == [2, 7]
+    assert restored.json()["project"]["edit_options"] == editor_state
+    assert restored.json()["project"]["creator_profile_id"] == "profile-draft"
 
 
 def test_project_markers_are_persistent_and_time_bounded(tmp_path):
@@ -117,6 +200,70 @@ def test_project_markers_are_persistent_and_time_bounded(tmp_path):
     assert listed[0]["label"] == "Best reaction"
     assert client.post("/api/projects/owned-project/markers", json={"time": 61, "label": "Outside"}).status_code == 422
     assert client.delete(f"/api/projects/owned-project/markers/{marker['id']}").status_code == 200
+
+
+def test_concurrent_edit_version_writes_are_not_lost(tmp_path):
+    client, db = _client(tmp_path, Barrier(2, timeout=5))
+
+    def save(name):
+        return client.post("/api/projects/owned-project/edit-versions", json={"name": name})
+
+    with client, ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(save, ["Concurrent A", "Concurrent B"]))
+
+    assert [response.status_code for response in responses] == [200, 200]
+    acknowledged_ids = {response.json()["version"]["id"] for response in responses}
+    project = asyncio.run(db.projects.find_one({"id": "owned-project"}))
+    assert {version["id"] for version in project["edit_versions"]} == acknowledged_ids
+    assert project["edit_versions_revision"] == 2
+
+
+def test_concurrent_marker_writes_are_not_lost(tmp_path):
+    client, db = _client(tmp_path, Barrier(2, timeout=5))
+
+    def create(payload):
+        return client.post("/api/projects/owned-project/markers", json=payload)
+
+    payloads = [
+        {"time": 20, "label": "Concurrent B"},
+        {"time": 10, "label": "Concurrent A"},
+    ]
+    with client, ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(create, payloads))
+
+    assert [response.status_code for response in responses] == [200, 200]
+    acknowledged_ids = {response.json()["marker"]["id"] for response in responses}
+    project = asyncio.run(db.projects.find_one({"id": "owned-project"}))
+    assert {marker["id"] for marker in project["edit_markers"]} == acknowledged_ids
+    assert [marker["time"] for marker in project["edit_markers"]] == [10, 20]
+    assert project["edit_markers_revision"] == 2
+
+
+def test_concurrent_marker_create_and_delete_both_take_effect(tmp_path):
+    client, db = _client(tmp_path, Barrier(2, timeout=5))
+    existing = {"id": "marker_existing", "time": 5, "label": "Remove me"}
+    asyncio.run(db.projects.update_one(
+        {"id": "owned-project"}, {"$set": {"edit_markers": [existing]}}
+    ))
+
+    with client, ThreadPoolExecutor(max_workers=2) as executor:
+        created_future = executor.submit(
+            client.post,
+            "/api/projects/owned-project/markers",
+            json={"time": 15, "label": "Keep me"},
+        )
+        deleted_future = executor.submit(
+            client.delete, "/api/projects/owned-project/markers/marker_existing"
+        )
+        created, deleted = created_future.result(), deleted_future.result()
+
+    assert created.status_code == 200
+    assert deleted.status_code == 200
+    project = asyncio.run(db.projects.find_one({"id": "owned-project"}))
+    assert [marker["id"] for marker in project["edit_markers"]] == [
+        created.json()["marker"]["id"]
+    ]
+    assert project["edit_markers_revision"] == 2
 
 
 def test_creator_dna_converts_internal_schema_validation_to_422(tmp_path):

@@ -11,7 +11,7 @@ import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable, Literal
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -23,7 +23,14 @@ from creator_dna import (
     observation_from_analyzed_project,
 )
 from edit_chat_engine import EditCommandError, EditSession, JournalEntry, compile_chat_request, validate_command
-from editorial_quality import assess_project, rubric
+from editorial_quality import (
+    assess_project,
+    effective_quality_review,
+    post_render_hard_failure_blocked,
+    post_render_qa_fingerprint,
+    project_has_render,
+    rubric,
+)
 
 
 class CreatorProfileBody(BaseModel):
@@ -47,6 +54,7 @@ class ApplyPreviewBody(BaseModel):
 class VersionBody(BaseModel):
     model_config = ConfigDict(extra="ignore")
     name: str = Field(default="Draft", min_length=1, max_length=80)
+    editor_state: dict[str, Any] | None = None
 
 
 class MarkerBody(BaseModel):
@@ -55,6 +63,12 @@ class MarkerBody(BaseModel):
     label: str = Field(min_length=1, max_length=120)
     kind: str = Field(default="note", min_length=1, max_length=32)
     color: str = Field(default="#ccff00", min_length=4, max_length=16)
+
+
+class PostRenderQAAcknowledgmentBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    acknowledge: Literal[True]
+    reason: str = Field(min_length=10, max_length=500)
 
 
 def _profile_json(profile) -> dict[str, Any]:
@@ -155,8 +169,46 @@ def _operation_summary(operation: dict[str, Any]) -> str:
     return labels.get(operation.get("type"), "Edit timeline")
 
 
-def register_premium_routes(api, db, user_id: str, get_project, update_project, require_plan=None) -> None:
+def _matched_count(result: Any) -> int:
+    if isinstance(result, dict):
+        return int(result.get("matched_count") or 0)
+    return int(getattr(result, "matched_count", 0) or 0)
+
+
+async def _revisioned_project_update(
+    db,
+    pid: str,
+    revision_field: str,
+    mutate: Callable[[dict[str, Any]], tuple[dict[str, Any], Any]],
+    initial_project: dict[str, Any],
+) -> Any:
+    """Apply a project mutation with optimistic concurrency control."""
+    project = initial_project
+    for _ in range(8):
+        revision_token = project.get(revision_field)
+        revision = revision_token if type(revision_token) is int and revision_token >= 0 else 0
+        fields, response = mutate(project)
+        result = await db.projects.update_one(
+            {"id": pid, revision_field: revision_token},
+            {"$set": {
+                **fields,
+                revision_field: revision + 1,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }},
+        )
+        if _matched_count(result):
+            return response
+        project = await db.projects.find_one({"id": pid}, {"_id": 0})
+        if not project:
+            raise HTTPException(404, "Project not found")
+    raise HTTPException(409, "The project changed repeatedly; retry the request")
+
+
+def register_premium_routes(api, db, user_id, get_project, update_project, require_plan=None) -> None:
     repository = CreatorDNARepository(db)
+
+    def uid() -> str:
+        return user_id() if callable(user_id) else user_id
 
     def require_pro() -> None:
         if require_plan:
@@ -165,7 +217,7 @@ def register_premium_routes(api, db, user_id: str, get_project, update_project, 
     @api.get("/creator-profiles")
     async def list_creator_profiles():
         require_pro()
-        return {"profiles": [_profile_json(item) for item in await repository.list(user_id)]}
+        return {"profiles": [_profile_json(item) for item in await repository.list(uid())]}
 
     @api.post("/creator-profiles/analyze")
     @api.post("/creator-profiles")
@@ -176,13 +228,13 @@ def register_premium_routes(api, db, user_id: str, get_project, update_project, 
         sources = [_source_payload(item, index) for index, item in enumerate(body.references)]
         try:
             request = CreatorDNAAnalysisInput.model_validate({
-                "owner_id": user_id, "profile_name": body.name,
+                "owner_id": uid(), "profile_name": body.name,
                 "sources": sources, "consent_confirmed": True,
             })
             observations = []
             for source in request.sources:
                 if source.asset_id:
-                    project = await db.projects.find_one({"id": source.asset_id, "user_id": user_id}, {"_id": 0})
+                    project = await db.projects.find_one({"id": source.asset_id, "user_id": uid()}, {"_id": 0})
                     if not project:
                         raise HTTPException(422, f"Owned project {source.asset_id!r} was not found")
                     observations.append(observation_from_analyzed_project(source.source_id, project))
@@ -202,7 +254,7 @@ def register_premium_routes(api, db, user_id: str, get_project, update_project, 
     async def context(pid: str):
         require_pro()
         project = await get_project(pid)
-        profiles = [_profile_json(item) for item in await repository.list(user_id)]
+        profiles = [_profile_json(item) for item in await repository.list(uid())]
         chat = copy.deepcopy(project.get("edit_chat") or {})
         fallback = _state_from_project(project, profiles)
         saved = _session_load(chat.get("session"), fallback)
@@ -229,7 +281,7 @@ def register_premium_routes(api, db, user_id: str, get_project, update_project, 
         broll = analysis.get("broll_moments") or []
         transitions = analysis.get("transitions") or []
         audio_cues = analysis.get("audio_cues") or []
-        qa = analysis.get("quality_review") or project.get("post_render_qa") or {}
+        qa, _ = effective_quality_review(project)
         qa_issues = qa.get("issues") or []
         duration = float(project.get("duration") or 0)
         word_count = len(words)
@@ -325,10 +377,16 @@ def register_premium_routes(api, db, user_id: str, get_project, update_project, 
             "high" if broll else "review",
         ))
 
+        quality = assess_project(project)
         finishing_priority = "high" if qa_issues else "review"
+        finishing_detail = (
+            "Hard post-render QA failures block publish-ready delivery and download until they are fixed or explicitly acknowledged."
+            if quality["delivery_blocked"] else
+            "The final pass should verify captions, audio, safe zones, and asset provenance before delivery."
+        )
         team[4]["notes"].append(note(
             "finishing-delivery", "Finishing Editor", "Prove the export is publishable",
-            "The final pass should verify captions, audio, safe zones, and asset provenance before delivery.",
+            finishing_detail,
             [f"{len(qa_issues)} QA issues recorded", f"{len(broll)} B-roll moments with provenance review"],
             "Run the final render QA, fix any caption or audio issue, and confirm every external asset is cleared.",
             finishing_priority,
@@ -352,8 +410,8 @@ def register_premium_routes(api, db, user_id: str, get_project, update_project, 
         return {
             "project_id": pid,
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "status": "review_ready",
-            "quality": assess_project(project),
+            "status": "delivery_blocked" if quality["delivery_blocked"] else "review_ready",
+            "quality": quality,
             "rubric": {"schema_version": rubric().get("schema_version"), "principle_count": len(rubric().get("principles") or [])},
             "team": team,
             "timeline": {"duration": duration, "events": timeline_events[:200]},
@@ -366,6 +424,42 @@ def register_premium_routes(api, db, user_id: str, get_project, update_project, 
             ],
         }
 
+    @api.post("/projects/{pid}/post-render-qa/acknowledge")
+    async def acknowledge_post_render_qa(pid: str, body: PostRenderQAAcknowledgmentBody):
+        project = await get_project(pid)
+        review = project.get("post_render_qa")
+        reason = body.reason.strip()
+        if len(reason) < 10:
+            raise HTTPException(422, "Acknowledgment reason must contain at least 10 non-whitespace characters")
+        if not project_has_render(project) or not isinstance(review, dict):
+            raise HTTPException(409, "A completed post-render QA review is required")
+        if review.get("hard_fail") is not True:
+            raise HTTPException(409, "The current post-render QA review has no hard failure to acknowledge")
+
+        acknowledgment = {
+            "schema_version": "klippd.post_render_qa_acknowledgment.v1",
+            "acknowledged": True,
+            "qa_fingerprint": post_render_qa_fingerprint(review),
+            "reason": reason,
+            "acknowledged_at": datetime.now(timezone.utc).isoformat(),
+            "issue_codes": [
+                str(issue.get("code"))
+                for issue in review.get("issues") or []
+                if isinstance(issue, dict) and issue.get("code")
+            ],
+        }
+        await update_project(
+            pid,
+            post_render_qa_acknowledgment=acknowledgment,
+            render_review_required=False,
+        )
+        updated = {**project, "post_render_qa_acknowledgment": acknowledgment, "render_review_required": False}
+        return {
+            "acknowledgment": acknowledgment,
+            "download_allowed": not post_render_hard_failure_blocked(updated),
+            "quality": assess_project(updated),
+        }
+
     @api.get("/projects/{pid}/edit-versions")
     async def list_edit_versions(pid: str):
         project = await get_project(pid)
@@ -374,19 +468,29 @@ def register_premium_routes(api, db, user_id: str, get_project, update_project, 
     @api.post("/projects/{pid}/edit-versions")
     async def save_edit_version(pid: str, body: VersionBody):
         project = await get_project(pid)
-        versions = list(project.get("edit_versions") or [])
+        snapshot = {
+            key: copy.deepcopy(project.get(key))
+            for key in ("analysis", "render_options", "edit_options", "chat_render_options", "chat_timeline", "creator_profile_id")
+        }
+        if body.editor_state is not None:
+            snapshot["edit_options"] = copy.deepcopy(body.editor_state)
+            if "creator_profile_id" in body.editor_state:
+                snapshot["creator_profile_id"] = copy.deepcopy(body.editor_state["creator_profile_id"])
         version = {
             "id": "version_" + uuid.uuid4().hex[:16],
             "name": body.name.strip(),
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "snapshot": {
-                key: copy.deepcopy(project.get(key))
-                for key in ("analysis", "render_options", "edit_options", "chat_render_options", "chat_timeline", "creator_profile_id")
-            },
+            "snapshot": snapshot,
         }
-        versions.append(version)
-        await update_project(pid, edit_versions=versions[-20:])
-        return {"version": version, "versions": versions[-20:]}
+
+        def append_version(current: dict[str, Any]):
+            versions = [*list(current.get("edit_versions") or []), version][-20:]
+            return {"edit_versions": versions}, versions
+
+        versions = await _revisioned_project_update(
+            db, pid, "edit_versions_revision", append_version, project
+        )
+        return {"version": version, "versions": versions}
 
     @api.post("/projects/{pid}/edit-versions/{version_id}/restore")
     async def restore_edit_version(pid: str, version_id: str):
@@ -409,24 +513,37 @@ def register_premium_routes(api, db, user_id: str, get_project, update_project, 
         duration = float(project.get("duration") or 0)
         if duration and body.time > duration:
             raise HTTPException(422, f"Marker time must be within the {duration:.2f}s project")
-        markers = list(project.get("edit_markers") or [])
         marker = {
             "id": "marker_" + uuid.uuid4().hex[:16],
             **body.model_dump(),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        markers.append(marker)
-        markers.sort(key=lambda item: float(item.get("time") or 0))
-        await update_project(pid, edit_markers=markers[-200:])
-        return {"marker": marker, "markers": markers[-200:]}
+
+        def append_marker(current: dict[str, Any]):
+            markers = [*list(current.get("edit_markers") or []), marker]
+            markers.sort(key=lambda item: float(item.get("time") or 0))
+            markers = markers[-200:]
+            return {"edit_markers": markers}, markers
+
+        markers = await _revisioned_project_update(
+            db, pid, "edit_markers_revision", append_marker, project
+        )
+        return {"marker": marker, "markers": markers}
 
     @api.delete("/projects/{pid}/markers/{marker_id}")
     async def delete_marker(pid: str, marker_id: str):
         project = await get_project(pid)
-        markers = [item for item in project.get("edit_markers") or [] if item.get("id") != marker_id]
-        if len(markers) == len(project.get("edit_markers") or []):
-            raise HTTPException(404, "Marker not found")
-        await update_project(pid, edit_markers=markers)
+
+        def remove_marker(current: dict[str, Any]):
+            existing = list(current.get("edit_markers") or [])
+            markers = [item for item in existing if item.get("id") != marker_id]
+            if len(markers) == len(existing):
+                raise HTTPException(404, "Marker not found")
+            return {"edit_markers": markers}, markers
+
+        markers = await _revisioned_project_update(
+            db, pid, "edit_markers_revision", remove_marker, project
+        )
         return {"status": "deleted", "markers": markers}
 
     @api.get("/projects/{pid}/edit-chat/history")
@@ -442,7 +559,7 @@ def register_premium_routes(api, db, user_id: str, get_project, update_project, 
             if body.creator_profile_id:
                 if body.creator_profile_id not in {item["id"] for item in profiles}:
                     raise HTTPException(422, "Select a saved Creator DNA profile")
-                selected_profile = await repository.get(user_id, body.creator_profile_id)
+                selected_profile = await repository.get(uid(), body.creator_profile_id)
                 if not selected_profile:
                     raise HTTPException(422, "Select a saved Creator DNA profile")
                 creator_grammar = selected_profile.grammar.model_dump(mode="json")

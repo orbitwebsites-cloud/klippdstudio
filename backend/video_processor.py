@@ -16,6 +16,27 @@ from typing import List, Dict, Any, Optional
 logger = logging.getLogger(__name__)
 
 
+_AUDIO_CONTAINER_FORMATS = {
+    ".aac": frozenset({"aac"}),
+    ".flac": frozenset({"flac"}),
+    ".m4a": frozenset({"mov", "mp4", "m4a", "3gp", "3g2", "mj2"}),
+    ".mp3": frozenset({"mp3"}),
+    ".ogg": frozenset({"ogg"}),
+    ".wav": frozenset({"wav"}),
+}
+_AUDIO_FORMAT_WHITELIST = ",".join(
+    sorted({name for names in _AUDIO_CONTAINER_FORMATS.values() for name in names})
+)
+
+
+def _local_audio_input_options() -> List[str]:
+    """Restrict untrusted music inputs to local, non-playlist demuxers."""
+    return [
+        "-protocol_whitelist", "file",
+        "-format_whitelist", _AUDIO_FORMAT_WHITELIST,
+    ]
+
+
 def run_ff(cmd: list, log: bool = True) -> None:
     if log:
         logger.info("FFMPEG: " + " ".join(shlex.quote(c) for c in cmd[:20]) + (" ..." if len(cmd) > 20 else ""))
@@ -42,11 +63,22 @@ def probe_video(path: str) -> Dict[str, Any]:
     }
 
 
-def probe_audio(path: str) -> Dict[str, Any]:
+def probe_audio(path: str, expected_extension: Optional[str] = None) -> Dict[str, Any]:
     """Probe an uploaded music bed without requiring a video stream."""
-    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", path]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    extension = (expected_extension or os.path.splitext(path)[1]).lower()
+    expected_formats = _AUDIO_CONTAINER_FORMATS.get(extension)
+    if not expected_formats:
+        raise RuntimeError("Unsupported audio container")
+    cmd = [
+        "ffprobe", "-v", "quiet", *_local_audio_input_options(),
+        "-print_format", "json", "-show_format", "-show_streams", path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
     data = json.loads(proc.stdout)
+    format_name = str(data.get("format", {}).get("format_name", ""))
+    detected_formats = {name.strip().lower() for name in format_name.split(",") if name.strip()}
+    if not detected_formats.intersection(expected_formats):
+        raise RuntimeError(f"Audio container does not match {extension}")
     audio = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
     if not audio:
         raise RuntimeError("No audio stream found")
@@ -55,6 +87,7 @@ def probe_audio(path: str) -> Dict[str, Any]:
         "channels": int(audio.get("channels", 0)),
         "sample_rate": int(audio.get("sample_rate", 0) or 0),
         "size": int(data.get("format", {}).get("size", 0)),
+        "format_name": format_name,
     }
 
 
@@ -476,7 +509,7 @@ def render_final(cut_video: str, ass_file: Optional[str], sfx_events: List[float
 
     bgm_idx = None
     if bgm_path and os.path.exists(bgm_path):
-        inputs += ["-stream_loop", "-1", "-i", bgm_path]
+        inputs += ["-stream_loop", "-1", *_local_audio_input_options(), "-i", bgm_path]
         bgm_idx = input_idx
         input_idx += 1
 

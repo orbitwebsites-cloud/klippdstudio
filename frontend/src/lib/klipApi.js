@@ -22,6 +22,23 @@ export const API = `${BACKEND_URL}/api`;
 
 const api = axios.create({ baseURL: API, timeout: 60000 });
 
+let authTokenProvider = null;
+
+export const setAuthTokenProvider = (provider) => {
+    authTokenProvider = provider;
+};
+
+api.interceptors.request.use(async (config) => {
+    if (authTokenProvider) {
+        const token = await authTokenProvider();
+        if (token) {
+            config.headers = config.headers || {};
+            config.headers.Authorization = `Bearer ${token}`;
+        }
+    }
+    return config;
+});
+
 export const listProjects = () => api.get("/projects").then((r) => {
     if (!Array.isArray(r.data)) {
         throw new Error("The server returned an invalid projects response.");
@@ -214,6 +231,8 @@ export const uploadMusic = (pid, file, rightsAttested = false) => {
     fd.append("rights_attestation", "I own or have commercial rights to this asset");
     return api.post(`/projects/${pid}/music_upload`, fd, { timeout: 0 }).then((r) => r.data);
 };
+export const removeMusic = (pid) =>
+    api.delete(`/projects/${pid}/music`).then((r) => r.data);
 export const isFeatureUnavailable = (error) => Boolean(featureAccessState(error));
 
 export const getCreatorProfiles = () =>
@@ -229,8 +248,11 @@ export const getEditorialTeamReview = (projectId) =>
     api.get(`/projects/${projectId}/editorial-team/review`).then((r) => r.data);
 export const getEditVersions = (projectId) =>
     api.get(`/projects/${projectId}/edit-versions`).then((r) => r.data);
-export const saveEditVersion = (projectId, name) =>
-    api.post(`/projects/${projectId}/edit-versions`, { name }).then((r) => r.data);
+export const saveEditVersion = (projectId, name, editorState) =>
+    api.post(`/projects/${projectId}/edit-versions`, {
+        name,
+        ...(editorState ? { editor_state: editorState } : {}),
+    }).then((r) => r.data);
 export const restoreEditVersion = (projectId, versionId) =>
     api.post(`/projects/${projectId}/edit-versions/${versionId}/restore`).then((r) => r.data);
 export const getProjectMarkers = (projectId) =>

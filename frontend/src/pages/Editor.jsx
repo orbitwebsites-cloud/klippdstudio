@@ -41,8 +41,10 @@ import {
     mediaClip,
     downloadUrl,
     apiErrorMessage,
+    featureAccessState,
     saveEditOptions,
     uploadMusic,
+    removeMusic,
 } from "@/lib/klipApi";
 
 const STATUS_LABELS = {
@@ -61,6 +63,97 @@ const STATUS_LABELS = {
 const IN_PROGRESS = new Set([
     "queued", "extracting_audio", "transcribing", "analyzing", "queued_render", "rendering",
 ]);
+
+const EDIT_OPTION_BOOLEAN_KEYS = [
+    "remove_fillers", "remove_silences", "captions", "sfx", "zoom_ins", "broll", "background_music",
+];
+
+const uniqueSortedIndices = (value) => (
+    Array.isArray(value)
+        ? [...new Set(value.filter(Number.isInteger))].sort((left, right) => left - right)
+        : []
+);
+
+const selectedBrollByWord = (value) => Object.fromEntries(
+    (Array.isArray(value) ? value : [])
+        .filter((item) => Number.isInteger(item?.word_index))
+        .map((item) => [item.word_index, { ...item }])
+);
+
+export const serializeEditorDraft = ({
+    style,
+    aspect,
+    renderOpts,
+    excludedFillers,
+    addedFillers,
+    brollSelected,
+    creatorProfileId,
+}) => ({
+    style,
+    aspect,
+    ...renderOpts,
+    excluded_filler_indices: uniqueSortedIndices([...excludedFillers]),
+    added_filler_indices: uniqueSortedIndices([...addedFillers]),
+    selected_broll: Object.entries(brollSelected)
+        .filter(([, selection]) => selection)
+        .map(([wordIndex, selection]) => ({
+            ...selection,
+            word_index: Number.isInteger(selection.word_index) ? selection.word_index : Number(wordIndex),
+        }))
+        .filter((selection) => Number.isInteger(selection.word_index))
+        .sort((left, right) => left.word_index - right.word_index),
+    creator_profile_id: creatorProfileId,
+});
+
+export const hydrateEditorOptions = (current, project) => {
+    const saved = project?.edit_options || {};
+    const hasAttachedMusic = Boolean(project?.background_music_path || project?.background_music_name);
+    return {
+        style: saved.style || current.style,
+        aspect: saved.aspect || current.aspect,
+        renderOpts: {
+            ...current.renderOpts,
+            ...Object.fromEntries(
+                EDIT_OPTION_BOOLEAN_KEYS
+                    .filter((key) => typeof saved[key] === "boolean")
+                    .map((key) => [key, saved[key]])
+            ),
+            ...(Number.isFinite(saved.silence_threshold) ? { silence_threshold: Number(saved.silence_threshold) } : {}),
+            ...(Number.isFinite(saved.background_music_volume) ? { background_music_volume: Number(saved.background_music_volume) } : {}),
+            background_music: hasAttachedMusic && (
+                typeof saved.background_music === "boolean" ? saved.background_music : true
+            ),
+        },
+        musicName: project?.background_music_name || "",
+        excludedFillers: new Set(uniqueSortedIndices(saved.excluded_filler_indices)),
+        addedFillers: new Set(uniqueSortedIndices(saved.added_filler_indices)),
+        brollSelected: selectedBrollByWord(saved.selected_broll),
+        creatorProfileId: Object.prototype.hasOwnProperty.call(saved, "creator_profile_id")
+            ? saved.creator_profile_id
+            : (project?.creator_profile_id || null),
+    };
+};
+
+export const getFocusedOutput = (project) => {
+    const saved = project?.focused_render;
+    const fallbackLabel = project?.last_clip_label?.startsWith("range_") ? project.last_clip_label : null;
+    const label = saved?.label || fallbackLabel;
+    if (!label || !project?.viral_renders?.[label]) return null;
+    const options = project?.render_options || {};
+    return {
+        label,
+        start: Number.isFinite(saved?.start) ? Number(saved.start) : Number(options.clip_start),
+        end: Number.isFinite(saved?.end) ? Number(saved.end) : Number(options.clip_end),
+    };
+};
+
+export const isInvalidRenderRange = (rangeStart, rangeEnd, duration) => {
+    if (rangeStart === "" && rangeEnd === "") return false;
+    const start = Number(rangeStart);
+    const end = Number(rangeEnd);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start) return true;
+    return Number(duration) > 0 && end > Number(duration);
+};
 
 export default function Editor() {
     const { id } = useParams();
@@ -94,12 +187,16 @@ export default function Editor() {
     const [draftLoadedFor, setDraftLoadedFor] = useState(null);
     const [showSettingsCue, setShowSettingsCue] = useState(false);
     const [musicUploading, setMusicUploading] = useState(false);
+    const [musicDetaching, setMusicDetaching] = useState(false);
     const [musicName, setMusicName] = useState("");
+    const [clipExtractionUpgrade, setClipExtractionUpgrade] = useState(false);
     const [teamPrompt, setTeamPrompt] = useState("");
     const videoRef = useRef();
     const transcriptRef = useRef();
     const brollFileInputRef = useRef();
     const settingsRef = useRef();
+    const autosavePausedRef = useRef(false);
+    const pendingRestoreRef = useRef(null);
     const trainingProfileId = useMemo(() => {
         try { return window.localStorage.getItem("klipped_active_training_profile") || null; }
         catch { return null; }
@@ -165,12 +262,13 @@ export default function Editor() {
         setRenderOpts((current) => ({
             ...current,
             ...Object.fromEntries(
-                ["remove_fillers", "remove_silences", "captions", "sfx", "zoom_ins", "broll", "background_music"]
+                EDIT_OPTION_BOOLEAN_KEYS
                     .filter((key) => typeof options[key] === "boolean")
                     .map((key) => [key, options[key]])
             ),
         }));
         if (Number.isFinite(options.silence_threshold)) setRenderOpts((current) => ({ ...current, silence_threshold: Number(options.silence_threshold) }));
+        if (Number.isFinite(options.background_music_volume)) setRenderOpts((current) => ({ ...current, background_music_volume: Number(options.background_music_volume) }));
         if (Array.isArray(options.selected_broll)) {
             setBrollSelected(Object.fromEntries(
                 options.selected_broll
@@ -183,20 +281,17 @@ export default function Editor() {
 
     useEffect(() => {
         if (!project || draftLoadedFor === project.id) return;
-        const saved = project.edit_options || {};
-        if (saved.style) setStyle(saved.style);
-        if (saved.aspect) setAspect(saved.aspect);
-        setRenderOpts((current) => ({
-            ...current,
-            ...Object.fromEntries(
-                ["remove_fillers", "remove_silences", "captions", "sfx", "zoom_ins", "broll", "background_music"]
-                    .filter((key) => typeof saved[key] === "boolean")
-                    .map((key) => [key, saved[key]])
-            ),
-        }));
-        if (Number.isFinite(saved.silence_threshold)) setRenderOpts((current) => ({ ...current, silence_threshold: Number(saved.silence_threshold) }));
+        const hydrated = hydrateEditorOptions({ style, aspect, renderOpts }, project);
+        setStyle(hydrated.style);
+        setAspect(hydrated.aspect);
+        setRenderOpts(hydrated.renderOpts);
+        setMusicName(hydrated.musicName);
+        setExcludedFillers(hydrated.excludedFillers);
+        setAddedFillers(hydrated.addedFillers);
+        setBrollSelected(hydrated.brollSelected);
+        setCreatorProfileId(hydrated.creatorProfileId);
         setDraftLoadedFor(project.id);
-    }, [project, draftLoadedFor]);
+    }, [project, draftLoadedFor, style, aspect, renderOpts]);
 
     useEffect(() => {
         if (!projectStatus || !["ready", "done"].includes(projectStatus)) return;
@@ -207,14 +302,42 @@ export default function Editor() {
         } catch { /* The cue is non-essential. */ }
     }, [id, projectStatus]);
 
+    const editorDraftRef = useRef(null);
+    editorDraftRef.current = serializeEditorDraft({
+        style,
+        aspect,
+        renderOpts,
+        excludedFillers,
+        addedFillers,
+        brollSelected,
+        creatorProfileId,
+    });
+
+    const flushEditOptions = useCallback(() => saveEditOptions(id, editorDraftRef.current), [id]);
+    const prepareDraftSnapshot = useCallback(async () => {
+        const snapshot = editorDraftRef.current;
+        await saveEditOptions(id, snapshot);
+        return snapshot;
+    }, [id]);
+
     useEffect(() => {
         if (!projectId || draftLoadedFor !== projectId) return undefined;
+        if (autosavePausedRef.current) return undefined;
         const timer = window.setTimeout(() => {
-            saveEditOptions(id, { style, aspect, ...renderOpts })
+            if (autosavePausedRef.current) return;
+            flushEditOptions()
                 .catch(() => toast.error("Could not save edit settings. Try again before rendering."));
         }, 500);
         return () => window.clearTimeout(timer);
-    }, [id, projectId, draftLoadedFor, style, aspect, renderOpts]);
+    }, [projectId, draftLoadedFor, style, aspect, renderOpts, flushEditOptions]);
+
+    useEffect(() => {
+        const pending = pendingRestoreRef.current;
+        if (!pending || pending.projectId !== projectId || draftLoadedFor !== projectId) return;
+        pendingRestoreRef.current = null;
+        autosavePausedRef.current = false;
+        pending.resolve();
+    }, [draftLoadedFor, projectId]);
 
     const effectiveFillers = useMemo(() => {
         const s = new Set(autoFillers);
@@ -249,7 +372,7 @@ export default function Editor() {
         return -1;
     }, [words, currentTime]);
 
-    const mediaDuration = Number(project.duration || videoRef.current?.duration || 0);
+    const mediaDuration = Number(project?.duration || videoRef.current?.duration || 0);
     const currentTimeRef = useRef(currentTime);
     const rangeEndRef = useRef(rangeEnd);
     const mediaDurationRef = useRef(mediaDuration);
@@ -263,6 +386,7 @@ export default function Editor() {
         if (mediaDuration > 0 && end > mediaDuration) return null;
         return { start, end };
     }, [rangeStart, rangeEnd, mediaDuration]);
+    const invalidRenderRange = isInvalidRenderRange(rangeStart, rangeEnd, mediaDuration);
 
     const setRangePoint = useCallback((point) => {
         const value = Math.max(0, Number(Number(currentTimeRef.current).toFixed(2)));
@@ -373,11 +497,17 @@ export default function Editor() {
         setExtractingClips(true);
         try {
             const r = await extractViralClips(id);
+            setClipExtractionUpgrade(false);
             setViralClips(r.clips || []);
             if (!r.clips?.length) toast.info("No viral moments found — try a longer clip");
             else toast.success(`Found ${r.clips.length} viral moments`);
         } catch (e) {
-            toast.error(apiErrorMessage(e, "Failed to extract clips"));
+            if (featureAccessState(e) === "upgrade") {
+                setClipExtractionUpgrade(true);
+                toast.error("Viral clip extraction requires Pro ($29 USD/month).");
+            } else {
+                toast.error(apiErrorMessage(e, "Failed to extract clips"));
+            }
         } finally {
             setExtractingClips(false);
         }
@@ -413,6 +543,10 @@ export default function Editor() {
     };
 
     const startRender = async () => {
+        if (invalidRenderRange) {
+            toast.error("Fix or clear the export range before rendering.");
+            return;
+        }
         setRenderStarting(true);
         const selected_broll = Object.entries(brollSelected)
             .filter(([, v]) => v)
@@ -455,6 +589,8 @@ export default function Editor() {
     // A short-form clip render also marks the project "done". Only switch the
     // main player to the final endpoint when a main output actually exists.
     const hasMainOutput = Boolean(project.output_path);
+    const focusedOutput = getFocusedOutput(project);
+    const focusedOutputIsLatest = Boolean(focusedOutput && focusedOutput.label === project.last_clip_label);
 
     const jumpToSettings = () => {
         settingsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -476,6 +612,48 @@ export default function Editor() {
         } catch (error) {
             toast.error(apiErrorMessage(error, "Music upload failed"));
         } finally { setMusicUploading(false); }
+    };
+
+    const detachMusic = async () => {
+        setMusicDetaching(true);
+        try {
+            await removeMusic(id);
+            setMusicName("");
+            setRenderOpts((current) => ({ ...current, background_music: false }));
+            setProject((current) => current ? {
+                ...current,
+                background_music_path: null,
+                background_music_name: null,
+                edit_options: { ...(current.edit_options || {}), background_music: false },
+            } : current);
+            toast.success("Music bed detached");
+        } catch (error) {
+            toast.error(apiErrorMessage(error, "Could not detach music"));
+        } finally {
+            setMusicDetaching(false);
+        }
+    };
+
+    const hydrateRestoredProject = (restoredProject) => {
+        if (!restoredProject) {
+            autosavePausedRef.current = false;
+            return Promise.resolve();
+        }
+        autosavePausedRef.current = true;
+        return new Promise((resolve) => {
+            pendingRestoreRef.current = { projectId: restoredProject.id || id, resolve };
+            setDraftLoadedFor(null);
+            setProject(restoredProject);
+        });
+    };
+
+    const pauseAutosaveForRestore = () => {
+        autosavePausedRef.current = true;
+    };
+
+    const resumeAutosaveAfterFailedRestore = () => {
+        autosavePausedRef.current = false;
+        setDraftLoadedFor(projectId);
     };
 
     const shouldShowSettingsCue = isReady && showSettingsCue;
@@ -552,7 +730,7 @@ export default function Editor() {
                     <div className="panel">
                         <video
                             ref={videoRef}
-                            src={hasMainOutput ? mediaOutput(project.id) : mediaOriginal(project.id)}
+                            src={focusedOutputIsLatest ? mediaClip(project.id, focusedOutput.label) : hasMainOutput ? mediaOutput(project.id) : mediaOriginal(project.id)}
                             controls
                             className="w-full aspect-video bg-black"
                             onTimeUpdate={(e) => setCurrentTime(e.target.currentTime)}
@@ -580,9 +758,27 @@ export default function Editor() {
                                 </label>
                                 <button type="button" className="btn-ghost !px-3 !py-2 text-xs" onClick={() => setRangePoint("end")} data-testid="set-range-end">Set at playhead</button>
                             </div>
-                            {(rangeStart || rangeEnd) && !normalizedRange && <div className="text-xs text-[#ff9b9b]" role="alert">Choose an out point after the in point{mediaDuration ? ` and keep it within ${mediaDuration.toFixed(2)} seconds` : ""}.</div>}
+                            {invalidRenderRange && <div id="render-range-error" className="text-xs text-[#ff9b9b]" role="alert">Choose an out point after the in point{mediaDuration ? ` and keep it within ${mediaDuration.toFixed(2)} seconds` : ""}.</div>}
                             {normalizedRange && <div className="text-xs text-[#ccff00]">Focused export: {normalizedRange.start.toFixed(2)}s–{normalizedRange.end.toFixed(2)}s ({(normalizedRange.end - normalizedRange.start).toFixed(2)}s)</div>}
                         </div>
+                        {focusedOutput && (
+                            <div className="p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 border-t border-white/10" data-testid="focused-output">
+                                <div>
+                                    <div className="font-mono text-xs text-[#ccff00] tracking-widest">FOCUSED EXPORT READY</div>
+                                    {Number.isFinite(focusedOutput.start) && Number.isFinite(focusedOutput.end) && (
+                                        <div className="mt-1 text-xs text-white/45">{focusedOutput.start.toFixed(2)}s to {focusedOutput.end.toFixed(2)}s</div>
+                                    )}
+                                </div>
+                                <a
+                                    href={downloadUrl(project.id, focusedOutput.label)}
+                                    className="btn-brand shrink-0"
+                                    data-testid="focused-download-btn"
+                                    download
+                                >
+                                    <Download className="w-4 h-4" /> Download Range
+                                </a>
+                            </div>
+                        )}
                         {hasMainOutput && (
                             <div className="p-4 flex items-center justify-between border-t border-white/10">
                                 <div className="font-mono text-xs text-[#ccff00] tracking-widest">
@@ -612,6 +808,10 @@ export default function Editor() {
                     {isReady && (
                         <EditorialTeamPanel
                             projectId={id}
+                            onBeforeSave={prepareDraftSnapshot}
+                            onBeforeRestore={pauseAutosaveForRestore}
+                            onRestored={hydrateRestoredProject}
+                            onRestoreFailed={resumeAutosaveAfterFailedRestore}
                             onUsePrompt={(prompt) => {
                                 setTeamPrompt(prompt);
                                 document.querySelector('[data-testid="edit-chat-panel"]')?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -827,7 +1027,7 @@ export default function Editor() {
                                 <Music className={`w-4 h-4 ${renderOpts.background_music ? "text-[#ccff00]" : "text-white/40"}`} />
                                 <div className="flex-1 min-w-0">
                                     <div className="text-sm font-semibold text-white">Background music</div>
-                                    <div className="text-[10px] font-mono text-white/40 truncate">{musicName || "Attach a licensed music bed"}</div>
+                                    <div className="text-[10px] font-mono text-white/40 truncate" data-testid="background-music-name">{musicName || "Attach a licensed music bed"}</div>
                                 </div>
                                 <label className="btn-ghost !px-2 !py-1.5 text-[10px] cursor-pointer">
                                     {musicUploading ? <Loader2 className="w-3 h-3 animate-spin" /> : "Upload"}
@@ -835,10 +1035,11 @@ export default function Editor() {
                                 </label>
                             </div>
                             {musicName && <div className="pl-7 mt-3 space-y-2">
+                                <div className="font-mono text-[10px] text-white/45" data-testid="background-music-state">{renderOpts.background_music ? "ENABLED" : "DISABLED"}</div>
                                 <label className="block text-[10px] font-mono text-white/45">MUSIC LEVEL <input type="range" min="0" max="0.35" step="0.01" value={renderOpts.background_music_volume} onChange={(event) => setRenderOpts((o) => ({ ...o, background_music_volume: Number(event.target.value) }))} className="w-full accent-[#ccff00] mt-2" aria-label="Background music level" /><span className="text-[#ccff00]">{Math.round(renderOpts.background_music_volume * 100)}%</span></label>
                                 <div className="flex gap-2">
-                                    <button type="button" className="btn-ghost !px-2 !py-1.5 text-[10px]" onClick={() => setRenderOpts((current) => ({ ...current, background_music: !current.background_music }))} data-testid="toggle-background-music">{renderOpts.background_music ? "Disable music" : "Enable music"}</button>
-                                    <button type="button" className="btn-ghost !px-2 !py-1.5 text-[10px]" onClick={() => { setMusicName(""); setRenderOpts((current) => ({ ...current, background_music: false })); }} data-testid="remove-background-music">Remove</button>
+                                    <button type="button" className="btn-ghost min-h-11 !px-3 text-[10px]" onClick={() => setRenderOpts((current) => ({ ...current, background_music: !current.background_music }))} data-testid="toggle-background-music">{renderOpts.background_music ? "Disable music" : "Enable music"}</button>
+                                    <button type="button" className="btn-ghost min-h-11 !px-3 text-[10px]" onClick={detachMusic} disabled={musicDetaching} data-testid="remove-background-music">{musicDetaching ? <Loader2 className="w-3 h-3 animate-spin" /> : "Detach"}</button>
                                 </div>
                             </div>}
                         </div>
@@ -854,7 +1055,8 @@ export default function Editor() {
 
                     <button
                         onClick={startRender}
-                        disabled={renderStarting || project.status === "rendering"}
+                        disabled={renderStarting || project.status === "rendering" || invalidRenderRange}
+                        aria-describedby={invalidRenderRange ? "render-range-error" : undefined}
                         className="btn-brand w-full !justify-center text-lg"
                         data-testid="render-btn"
                     >
@@ -1042,7 +1244,7 @@ export default function Editor() {
                             <div className="font-mono text-xs text-white/40 tracking-widest mb-2">// AI HIGHLIGHT REEL</div>
                             <div className="font-display text-3xl tracking-wider">VIRAL CLIPS</div>
                             <div className="text-white/50 text-sm mt-1">
-                                Ranked from story, hook, audio energy, pacing, and clarity signals
+                                Pro includes ranked clip extraction from story, hook, audio energy, pacing, and clarity signals.
                             </div>
                         </div>
                         <button
@@ -1056,9 +1258,16 @@ export default function Editor() {
                             ) : (
                                 <Flame className="w-4 h-4" />
                             )}
-                            {viralClips.length ? "Re-extract" : "Find Viral Clips"}
+                            {viralClips.length ? "Re-extract Pro Clips" : "Find Viral Clips (Pro)"}
                         </button>
                     </div>
+
+                    {clipExtractionUpgrade && (
+                        <div className="mb-5 border border-[#ccff00]/30 bg-[#ccff00]/[0.05] p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3" role="alert" data-testid="clip-extraction-upgrade">
+                            <div><div className="font-mono text-xs text-[#ccff00]">PRO FEATURE</div><p className="mt-1 text-sm text-white/65">Starter is $19 USD/month. Viral clip extraction is included with Pro at $29 USD/month.</p></div>
+                            <button type="button" className="btn-brand min-h-11 justify-center shrink-0" onClick={() => navigate("/pricing")}>View Pro</button>
+                        </div>
+                    )}
 
                     {viralClips.length > 0 && (
                         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">

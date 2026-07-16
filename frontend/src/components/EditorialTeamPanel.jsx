@@ -1,16 +1,39 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ArrowUpRight, BookOpen, Gauge, Image, Loader2, RefreshCw, ShieldCheck, UserRound } from "lucide-react";
 import { apiErrorMessage, getEditVersions, getEditorialTeamReview, restoreEditVersion, saveEditVersion } from "@/lib/klipApi";
 
 const ICONS = { story: BookOpen, rhythm: Gauge, performance: UserRound, visual: Image, finishing: ShieldCheck };
 
-export default function EditorialTeamPanel({ projectId, onUsePrompt }) {
+export const layoutTimelineCues = (events = [], duration = 0, minimumGapPercent = 7) => {
+    const total = Number(duration) || 0;
+    const laneEnds = [];
+    const cues = events
+        .map((event, sourceIndex) => ({
+            ...event,
+            sourceIndex,
+            left: total > 0 ? Math.max(0, Math.min(100, (Number(event.time || 0) / total) * 100)) : 0,
+        }))
+        .sort((a, b) => a.left - b.left || a.sourceIndex - b.sourceIndex)
+        .map((cue) => {
+            let lane = laneEnds.findIndex((end) => cue.left - end >= minimumGapPercent);
+            if (lane < 0) lane = laneEnds.length;
+            laneEnds[lane] = cue.left;
+            return { ...cue, lane };
+        });
+    return { cues, laneCount: Math.max(1, laneEnds.length) };
+};
+
+export default function EditorialTeamPanel({ projectId, onUsePrompt, onBeforeSave, onBeforeRestore, onRestored, onRestoreFailed }) {
     const [review, setReview] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState("");
     const [expanded, setExpanded] = useState(null);
     const [versions, setVersions] = useState([]);
     const [versionWorking, setVersionWorking] = useState(false);
+    const cueLayout = useMemo(
+        () => layoutTimelineCues(review?.timeline?.events || [], review?.timeline?.duration),
+        [review?.timeline?.events, review?.timeline?.duration]
+    );
 
     const load = useCallback(async () => {
         setLoading(true);
@@ -27,7 +50,8 @@ export default function EditorialTeamPanel({ projectId, onUsePrompt }) {
     const saveDraft = async () => {
         setVersionWorking(true);
         try {
-            const result = await saveEditVersion(projectId, `Draft ${versions.length + 1}`);
+            const editorState = await onBeforeSave?.();
+            const result = await saveEditVersion(projectId, `Draft ${versions.length + 1}`, editorState);
             setVersions(result.versions || []);
         } catch (exception) { setError(apiErrorMessage(exception, "Draft could not be saved")); }
         finally { setVersionWorking(false); }
@@ -35,8 +59,16 @@ export default function EditorialTeamPanel({ projectId, onUsePrompt }) {
 
     const restoreDraft = async (versionId) => {
         setVersionWorking(true);
-        try { await restoreEditVersion(projectId, versionId); await load(); }
-        catch (exception) { setError(apiErrorMessage(exception, "Draft could not be restored")); }
+        try {
+            await onBeforeRestore?.();
+            const result = await restoreEditVersion(projectId, versionId);
+            await onRestored?.(result?.project);
+            await load();
+        }
+        catch (exception) {
+            await onRestoreFailed?.();
+            setError(apiErrorMessage(exception, "Draft could not be restored"));
+        }
         finally { setVersionWorking(false); }
     };
 
@@ -50,7 +82,7 @@ export default function EditorialTeamPanel({ projectId, onUsePrompt }) {
                     <h2 className="font-display text-2xl tracking-wider mt-1">FIVE SETS OF EYES</h2>
                     <p className="text-xs text-white/45 mt-1 max-w-2xl">Evidence-backed notes from story, rhythm, performance, visual, and finishing roles. Nothing changes until you send a note to Edit Copilot and approve its preview.</p>
                 </div>
-                <button type="button" className="btn-ghost !p-2" onClick={load} disabled={loading} aria-label="Refresh editorial review" data-testid="refresh-editorial-team">
+                <button type="button" className="btn-ghost !p-0 w-11 h-11 justify-center" onClick={load} disabled={loading} aria-label="Refresh editorial review" data-testid="refresh-editorial-team">
                     {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
                 </button>
             </div>
@@ -65,37 +97,41 @@ export default function EditorialTeamPanel({ projectId, onUsePrompt }) {
                         </div>
                         <div className="border border-white/10 bg-black p-4" data-testid="editorial-review-timeline">
                             <div className="flex items-center justify-between gap-3"><div className="font-mono text-[10px] tracking-widest text-white/45">// REVIEW TIMELINE</div><div className="font-mono text-[10px] text-white/35">{review.timeline?.events?.length || 0} CUES</div></div>
-                            <div className="relative mt-5 h-12 border-y border-white/10">
-                                <div className="absolute inset-x-0 top-1/2 border-t border-white/10" />
-                                {(review.timeline?.events || []).map((event, index) => {
-                                    const duration = Number(review.timeline?.duration || 0);
-                                    const left = duration > 0 ? Math.max(0, Math.min(100, (Number(event.time || 0) / duration) * 100)) : 0;
+                            <div className="mt-4 overflow-x-auto" role="region" aria-label="Editorial review cues">
+                                <div className="relative min-w-[640px] border-y border-white/10" style={{ height: `${cueLayout.laneCount * 48 + 8}px` }}>
+                                    <div className="absolute inset-x-0 top-1/2 border-t border-white/10" />
+                                    {cueLayout.cues.map((event) => {
                                     const color = event.type === "filler" ? "#ff4f5e" : event.type === "broll" ? "#ff4f8b" : "#00d9ff";
-                                    return <button type="button" key={`${event.type}-${event.time}-${index}`} title={`${event.label} at ${Number(event.time || 0).toFixed(2)}s`} aria-label={`${event.label} at ${Number(event.time || 0).toFixed(2)} seconds`} className="absolute top-1/2 -translate-y-1/2 w-2 h-7 -ml-1" style={{ left: `${left}%`, background: color }} onClick={() => onUsePrompt?.(`Review the ${event.type} cue at ${Number(event.time || 0).toFixed(2)} seconds: ${event.label}. Keep or remove it based on whether it improves the story.`)} data-testid={`timeline-cue-${index}`} />;
-                                })}
+                                        return <button type="button" key={`${event.type}-${event.time}-${event.sourceIndex}`} title={`${event.label} at ${Number(event.time || 0).toFixed(2)}s`} aria-label={`${event.label} at ${Number(event.time || 0).toFixed(2)} seconds`} className="absolute flex h-11 w-11 -translate-x-1/2 items-center justify-center focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#ccff00]" style={{ left: `clamp(22px, ${event.left}%, calc(100% - 22px))`, top: `${event.lane * 48 + 4}px` }} onClick={() => onUsePrompt?.(`Review the ${event.type} cue at ${Number(event.time || 0).toFixed(2)} seconds: ${event.label}. Keep or remove it based on whether it improves the story.`)} data-testid={`timeline-cue-${event.sourceIndex}`}><span className="h-7 w-2" style={{ background: color }} aria-hidden="true" /></button>;
+                                    })}
+                                </div>
                             </div>
                             <div className="mt-2 flex flex-wrap gap-3 font-mono text-[10px] text-white/40"><span><i className="inline-block w-2 h-2 bg-[#ff4f5e] mr-1" />FILLER</span><span><i className="inline-block w-2 h-2 bg-[#ff4f8b] mr-1" />B-ROLL</span><span><i className="inline-block w-2 h-2 bg-[#00d9ff] mr-1" />EDIT CUE</span></div>
                         </div>
                         <div className="border border-white/10 bg-black p-4" data-testid="edit-versions">
-                            <div className="flex items-center justify-between gap-3"><div><div className="font-mono text-[10px] tracking-widest text-white/45">// DRAFT MEMORY</div><div className="mt-1 text-xs text-white/45">Save a checkpoint before trying a team recommendation.</div></div><button type="button" className="btn-ghost !px-3 !py-2 text-xs" onClick={saveDraft} disabled={versionWorking}>{versionWorking ? <Loader2 className="w-3 h-3 animate-spin" /> : "Save draft"}</button></div>
-                            {versions.length > 0 && <div className="mt-3 grid gap-2">{versions.slice().reverse().slice(0, 4).map((version) => <div key={version.id} className="flex items-center justify-between gap-3 border-t border-white/10 pt-2"><span className="font-mono text-[10px] text-white/50">{version.name} · {new Date(version.created_at).toLocaleString()}</span><button type="button" className="text-[10px] font-mono uppercase text-[#ccff00]" onClick={() => restoreDraft(version.id)} disabled={versionWorking}>Restore</button></div>)}</div>}
+                            <div className="flex items-center justify-between gap-3"><div><div className="font-mono text-[10px] tracking-widest text-white/45">// DRAFT MEMORY</div><div className="mt-1 text-xs text-white/45">Save a checkpoint before trying a team recommendation.</div></div><button type="button" className="btn-ghost min-h-11 !px-3 text-xs" onClick={saveDraft} disabled={versionWorking}>{versionWorking ? <Loader2 className="w-3 h-3 animate-spin" /> : "Save draft"}</button></div>
+                            {versions.length > 0 && <div className="mt-3 grid gap-2">{versions.slice().reverse().slice(0, 4).map((version) => <div key={version.id} className="flex items-center justify-between gap-3 border-t border-white/10 pt-2"><span className="font-mono text-[10px] text-white/50">{version.name} · {new Date(version.created_at).toLocaleString()}</span><button type="button" className="min-h-11 px-2 text-[10px] font-mono uppercase text-[#ccff00]" onClick={() => restoreDraft(version.id)} disabled={versionWorking}>Restore</button></div>)}</div>}
                         </div>
                         {review.team.map((member) => {
                             const Icon = ICONS[member.id] || BookOpen;
                             const isOpen = expanded === member.id;
-                            const note = member.notes?.[0];
+                            const notes = member.notes || [];
                             return (
                                 <div key={member.id} className="border border-white/10 bg-black" data-testid={`editorial-role-${member.id}`}>
-                                    <button type="button" className="w-full text-left p-3 flex items-center gap-3" onClick={() => setExpanded(isOpen ? null : member.id)} aria-expanded={isOpen}>
+                                    <button type="button" className="w-full min-h-11 text-left p-3 flex items-center gap-3" onClick={() => setExpanded(isOpen ? null : member.id)} aria-expanded={isOpen}>
                                         <Icon className="w-4 h-4 shrink-0" style={{ color: member.color }} />
                                         <span className="min-w-0 flex-1"><span className="block font-mono text-xs uppercase tracking-wider text-white/80">{member.name}</span><span className="block mt-1 text-xs text-white/40">{member.editorial_lens}</span></span>
                                         <span className="font-mono text-[10px] text-white/35">{member.notes?.length || 0} NOTE{member.notes?.length === 1 ? "" : "S"}</span>
                                     </button>
-                                    {isOpen && note && (
-                                        <div className="border-t border-white/10 p-4">
-                                            <div className="flex items-start justify-between gap-3"><div><div className="font-heading text-xl tracking-wider">{note.title}</div><div className="mt-2 text-sm leading-6 text-white/65">{note.detail}</div></div><span className={`font-mono text-[10px] uppercase ${note.priority === "high" ? "text-[#ffb000]" : "text-white/35"}`}>{note.priority}</span></div>
-                                            <div className="mt-3 flex flex-wrap gap-2">{note.evidence.map((item) => <span key={item} className="border border-white/10 px-2 py-1 font-mono text-[10px] text-white/45">{item}</span>)}</div>
-                                            <div className="mt-4 flex items-center justify-between gap-3 border-t border-white/10 pt-3"><p className="text-xs text-white/45 flex-1">Suggested edit: {note.prompt}</p><button type="button" className="btn-brand !px-3 !py-2 text-xs shrink-0" onClick={() => onUsePrompt?.(note.prompt)} data-testid={`use-editorial-note-${member.id}`}><ArrowUpRight className="w-3 h-3" /> Send to Copilot</button></div>
+                                    {isOpen && notes.length > 0 && (
+                                        <div className="border-t border-white/10 divide-y divide-white/10">
+                                            {notes.map((note, noteIndex) => (
+                                                <article className="p-4" key={note.id || `${member.id}-${noteIndex}`} data-testid={`editorial-note-${member.id}-${noteIndex}`}>
+                                                    <div className="flex items-start justify-between gap-3"><div><div className="font-heading text-xl tracking-wider">{note.title}</div><div className="mt-2 text-sm leading-6 text-white/65">{note.detail}</div></div><span className={`font-mono text-[10px] uppercase ${note.priority === "high" ? "text-[#ffb000]" : "text-white/35"}`}>{note.priority}</span></div>
+                                                    <div className="mt-3 flex flex-wrap gap-2">{(note.evidence || []).map((item) => <span key={item} className="border border-white/10 px-2 py-1 font-mono text-[10px] text-white/45">{item}</span>)}</div>
+                                                    <div className="mt-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 border-t border-white/10 pt-3"><p className="text-xs text-white/45 flex-1">Suggested edit: {note.prompt}</p><button type="button" className="btn-brand min-h-11 !px-3 text-xs shrink-0 justify-center" onClick={() => onUsePrompt?.(note.prompt)} data-testid={`use-editorial-note-${member.id}-${noteIndex}`}><ArrowUpRight className="w-3 h-3" /> Send to Copilot</button></div>
+                                                </article>
+                                            ))}
                                         </div>
                                     )}
                                 </div>
