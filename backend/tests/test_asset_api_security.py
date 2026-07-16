@@ -324,10 +324,14 @@ def test_render_uses_only_checksum_registered_assets(api_env, monkeypatch):
     }))
 
     captured = {}
-    monkeypatch.setattr(server.vp, "build_keep_segments", lambda *_args: [{"start": 0.0, "end": 2.0}])
+    monkeypatch.setattr(
+        server.vp,
+        "build_keep_segments",
+        lambda *_args, **_kwargs: [{"start": 0.0, "end": 2.0}],
+    )
     monkeypatch.setattr(server.vp, "cut_and_concat", lambda *_args: Path(_args[2]).write_bytes(b"cut"))
 
-    def fake_render(_cut, _ass, _sfx, broll_events, _sfx_dir, output):
+    def fake_render(_cut, _ass, _sfx, broll_events, _sfx_dir, output, *_args):
         captured["events"] = broll_events
         Path(output).write_bytes(b"rendered" * 200)
 
