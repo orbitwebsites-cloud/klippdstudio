@@ -5,7 +5,50 @@ import axios from "axios";
 const BACKEND_URL = (process.env.REACT_APP_BACKEND_URL || "https://api.klippdstudio.com").replace(/\/$/, "");
 export const API = `${BACKEND_URL}/api`;
 
+// Stable per-browser identity used to isolate each visitor's projects and
+// clips on the shared backend. Without this the server groups everyone into one
+// bucket, so unrelated users would see each other's uploads. Persisted in
+// localStorage so it survives reloads; regenerated only if storage is cleared.
+const CLIENT_ID_KEY = "klippd_client_id";
+
+const randomClientId = () => {
+    try {
+        if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+    } catch { /* fall through to manual id */ }
+    return `c-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+};
+
+export const getClientId = () => {
+    try {
+        let id = window.localStorage.getItem(CLIENT_ID_KEY);
+        if (!id) {
+            id = randomClientId();
+            window.localStorage.setItem(CLIENT_ID_KEY, id);
+        }
+        return id;
+    } catch {
+        // Storage blocked (e.g. private mode): fall back to a per-session id so
+        // requests are still scoped, even if not stable across reloads.
+        if (!window.__klippdClientId) window.__klippdClientId = randomClientId();
+        return window.__klippdClientId;
+    }
+};
+
 const api = axios.create({ baseURL: API, timeout: 60000 });
+
+// Attach the client identity to every API request so the backend scopes data
+// to this browser. Media/download URLs (loaded as <video src>, etc.) cannot
+// carry headers, so those helpers append a `client` query parameter instead.
+api.interceptors.request.use((config) => {
+    config.headers = config.headers || {};
+    config.headers["X-Klippd-Client"] = getClientId();
+    return config;
+});
+
+const withClient = (url) => {
+    const sep = url.includes("?") ? "&" : "?";
+    return `${url}${sep}client=${encodeURIComponent(getClientId())}`;
+};
 
 export const listProjects = () => api.get("/projects").then((r) => {
     if (!Array.isArray(r.data)) {
@@ -211,13 +254,13 @@ export const getSubscription = () => api.get("/subscription").then((r) => r.data
 export const createCheckout = (plan) => api.post("/billing/checkout", { plan }).then((r) => r.data);
 export const createBillingPortal = () => api.post("/billing/portal").then((r) => r.data);
 
-export const mediaOriginal = (id) => `${API}/media/original/${id}`;
-export const mediaOutput = (id) => `${API}/media/output/${id}`;
-export const mediaClip = (id, label) => `${API}/media/clip/${id}/${encodeURIComponent(label)}`;
+export const mediaOriginal = (id) => withClient(`${API}/media/original/${id}`);
+export const mediaOutput = (id) => withClient(`${API}/media/output/${id}`);
+export const mediaClip = (id, label) => withClient(`${API}/media/clip/${id}/${encodeURIComponent(label)}`);
 export const mediaThumbnail = () => null;
 export const downloadUrl = (id, clipLabel) =>
     clipLabel
-        ? `${API}/projects/${id}/download?clip=${encodeURIComponent(clipLabel)}`
-        : `${API}/projects/${id}/download`;
+        ? withClient(`${API}/projects/${id}/download?clip=${encodeURIComponent(clipLabel)}`)
+        : withClient(`${API}/projects/${id}/download`);
 
 export default api;

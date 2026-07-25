@@ -90,7 +90,7 @@ def test_library_explicit_attestation_publishes_and_can_be_served(api_env):
 
 
 def test_broll_upload_requires_the_same_explicit_rights_contract(api_env, monkeypatch):
-    asyncio.run(api_env.db.projects.insert_one({"id": "project-1"}))
+    asyncio.run(api_env.db.projects.insert_one({"id": "project-1", "user_id": server.USER_ID}))
     monkeypatch.setattr(server.vp, "probe_video", lambda _path: {"duration": 2.5, "width": 1280, "height": 720})
     original_validate = asset_pack_manager.validate_media
 
@@ -185,8 +185,8 @@ def test_analysis_uses_semantic_pack_match_and_generates_only_the_unmatched_requ
     original = api_env.data_dir / "videos" / "analysis.mp4"
     original.write_bytes(b"source")
     asyncio.run(api_env.db.projects.insert_one({
-        "id": "project-analysis", "status": "uploaded", "original_path": str(original),
-        "duration": 4.0, "width": 1920, "height": 1080,
+        "id": "project-analysis", "user_id": server.USER_ID, "status": "uploaded",
+        "original_path": str(original), "duration": 4.0, "width": 1920, "height": 1080,
     }))
 
     async def fake_keys():
@@ -231,7 +231,7 @@ def test_analysis_uses_semantic_pack_match_and_generates_only_the_unmatched_requ
     monkeypatch.setattr(server.ai, "analyze_transcript", fake_analyze)
     monkeypatch.setattr(server, "ASSET_ORCHESTRATOR", SemanticOrchestrator())
 
-    asyncio.run(server._run_analysis("project-analysis"))
+    asyncio.run(server._run_analysis("project-analysis", server.USER_ID))
     project = asyncio.run(api_env.db.projects.find_one({"id": "project-analysis"}))
     assert project["status"] == "ready"
     analysis = project["analysis"]
@@ -278,6 +278,7 @@ def test_render_uses_only_checksum_registered_assets(api_env, monkeypatch):
     original.write_bytes(b"source")
     asyncio.run(api_env.db.projects.insert_one({
         "id": "project-render",
+        "user_id": server.USER_ID,
         "status": "analyzed",
         "original_path": str(original),
         "duration": 2.0,
@@ -307,7 +308,7 @@ def test_render_uses_only_checksum_registered_assets(api_env, monkeypatch):
         {"video_url": "https://evil.example/asset.mp4", "word_index": 0},
     ]
     options = server.RenderOptions(captions=False, sfx=False, selected_broll=selections)
-    asyncio.run(server._run_render("project-render", options))
+    asyncio.run(server._run_render("project-render", options, server.USER_ID))
 
     assert [event["local_path"] for event in captured["events"]] == [str(approved)]
     project = asyncio.run(api_env.db.projects.find_one({"id": "project-render"}))

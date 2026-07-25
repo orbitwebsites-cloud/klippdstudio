@@ -141,8 +141,13 @@ def _operation_summary(operation: dict[str, Any]) -> str:
     return labels.get(operation.get("type"), "Edit timeline")
 
 
-def register_premium_routes(api, db, user_id: str, get_project, update_project, require_plan=None) -> None:
+def register_premium_routes(api, db, resolve_user_id, get_project, update_project, require_plan=None) -> None:
     repository = CreatorDNARepository(db)
+
+    # `resolve_user_id` returns the per-client data-isolation key for the request
+    # currently being handled. Accept a plain string too for backward compat.
+    def user_id() -> str:
+        return resolve_user_id() if callable(resolve_user_id) else resolve_user_id
 
     def require_pro() -> None:
         if require_plan:
@@ -151,7 +156,7 @@ def register_premium_routes(api, db, user_id: str, get_project, update_project, 
     @api.get("/creator-profiles")
     async def list_creator_profiles():
         require_pro()
-        return {"profiles": [_profile_json(item) for item in await repository.list(user_id)]}
+        return {"profiles": [_profile_json(item) for item in await repository.list(user_id())]}
 
     @api.post("/creator-profiles/analyze")
     @api.post("/creator-profiles")
@@ -162,13 +167,13 @@ def register_premium_routes(api, db, user_id: str, get_project, update_project, 
         sources = [_source_payload(item, index) for index, item in enumerate(body.references)]
         try:
             request = CreatorDNAAnalysisInput.model_validate({
-                "owner_id": user_id, "profile_name": body.name,
+                "owner_id": user_id(), "profile_name": body.name,
                 "sources": sources, "consent_confirmed": True,
             })
             observations = []
             for source in request.sources:
                 if source.asset_id:
-                    project = await db.projects.find_one({"id": source.asset_id, "user_id": user_id}, {"_id": 0})
+                    project = await db.projects.find_one({"id": source.asset_id, "user_id": user_id()}, {"_id": 0})
                     if not project:
                         raise HTTPException(422, f"Owned project {source.asset_id!r} was not found")
                     observations.append(observation_from_analyzed_project(source.source_id, project))
@@ -188,7 +193,7 @@ def register_premium_routes(api, db, user_id: str, get_project, update_project, 
     async def context(pid: str):
         require_pro()
         project = await get_project(pid)
-        profiles = [_profile_json(item) for item in await repository.list(user_id)]
+        profiles = [_profile_json(item) for item in await repository.list(user_id())]
         chat = copy.deepcopy(project.get("edit_chat") or {})
         fallback = _state_from_project(project, profiles)
         saved = _session_load(chat.get("session"), fallback)
@@ -212,7 +217,7 @@ def register_premium_routes(api, db, user_id: str, get_project, update_project, 
             if body.creator_profile_id:
                 if body.creator_profile_id not in {item["id"] for item in profiles}:
                     raise HTTPException(422, "Select a saved Creator DNA profile")
-                selected_profile = await repository.get(user_id, body.creator_profile_id)
+                selected_profile = await repository.get(user_id(), body.creator_profile_id)
                 if not selected_profile:
                     raise HTTPException(422, "Select a saved Creator DNA profile")
                 creator_grammar = selected_profile.grammar.model_dump(mode="json")

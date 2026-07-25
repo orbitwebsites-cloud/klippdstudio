@@ -11,7 +11,7 @@ Endpoints:
   GET    /api/media/original/{id}      Stream original video
   GET    /api/media/output/{id}        Stream output video
 """
-from fastapi import FastAPI, APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks, Depends
 from fastapi.responses import FileResponse
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -24,6 +24,7 @@ from pathlib import Path
 import os
 import re
 import json
+import contextvars
 import logging
 import mimetypes
 import uuid
@@ -90,7 +91,31 @@ UPLOAD_COMPRESSION_CRF = int(os.environ.get("UPLOAD_COMPRESSION_CRF", "26"))
 RETENTION_SWEEP_HOURS = max(1, int(os.environ.get("RETENTION_SWEEP_HOURS", "6")))
 CHUNK_BYTES = 4 * 1024 * 1024
 
-USER_ID = "default_user"  # single-user MVP
+USER_ID = "default_user"  # deployment-global bucket (server-managed keys, billing plan)
+
+# Per-client data isolation.
+#
+# The app began as a single-user MVP where every project was stored under the
+# constant USER_ID above. Once the site was public, that meant every visitor
+# shared one bucket and could see each other's uploads and clips. We now derive
+# a stable per-browser identity from a client-supplied header and scope all
+# private data (projects, training material, creator profiles) to it. Provider
+# credentials and the subscription plan remain deployment-level under USER_ID.
+CLIENT_ID_HEADER = "x-klippd-client"
+_client_id_sanitizer = re.compile(r"[^a-zA-Z0-9_-]")
+_current_user_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_user_id", default=USER_ID
+)
+
+
+def current_user_id() -> str:
+    """The data-isolation key for the request currently being handled."""
+    return _current_user_id.get()
+
+
+def _client_to_user_id(raw: str) -> str:
+    token = _client_id_sanitizer.sub("", (raw or "").strip())[:64]
+    return f"client_{token}" if token else USER_ID
 
 PLAN_POLICIES = {
     "basic": {"price_usd_monthly": 19, "retention_days": 7},
@@ -129,8 +154,24 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 logger = logging.getLogger("backend")
 
+async def bind_current_user(request: Request) -> str:
+    """Resolve the per-client data-isolation key from the request.
+
+    The client id normally arrives in a header, but media/download URLs are
+    loaded directly by the browser (e.g. <video src>) and cannot carry custom
+    headers, so a `client` query parameter is accepted as a fallback.
+
+    Runs as a router dependency so the contextvar is set inside each request's
+    task before the endpoint body (and helpers like get_project) execute.
+    """
+    raw = request.headers.get(CLIENT_ID_HEADER, "") or request.query_params.get("client", "")
+    user_id = _client_to_user_id(raw)
+    _current_user_id.set(user_id)
+    return user_id
+
+
 app = FastAPI(title="AI Video Editor")
-api = APIRouter(prefix="/api")
+api = APIRouter(prefix="/api", dependencies=[Depends(bind_current_user)])
 APP_ACCESS_TOKEN = os.environ.get("APP_ACCESS_TOKEN", "").strip()
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
@@ -329,11 +370,15 @@ class TrainingProfileBody(BaseModel):
 # ---------- HELPERS ----------
 async def update_project(pid: str, **fields) -> None:
     fields["updated_at"] = datetime.now(timezone.utc).isoformat()
-    await db.projects.update_one({"id": pid}, {"$set": fields})
+    await db.projects.update_one(
+        {"id": pid, "user_id": current_user_id()}, {"$set": fields}
+    )
 
 
 async def get_project(pid: str) -> Dict:
-    doc = await db.projects.find_one({"id": pid}, {"_id": 0})
+    doc = await db.projects.find_one(
+        {"id": pid, "user_id": current_user_id()}, {"_id": 0}
+    )
     if not doc:
         raise HTTPException(404, "Project not found")
     return doc
@@ -372,7 +417,9 @@ async def purge_expired_projects() -> int:
     """Delete expired projects and migrate older records to the current plan policy."""
     now = datetime.now(timezone.utc)
     removed = 0
-    projects = await db.projects.find({"user_id": USER_ID}, {"_id": 0}).to_list(10000)
+    # Deployment-wide sweep: retention is a deployment-level policy, so it runs
+    # across every client's projects, not just the current request's user.
+    projects = await db.projects.find({}, {"_id": 0}).to_list(10000)
     for project in projects:
         plan = project.get("subscription_plan") or subscription_plan()
         if plan not in PLAN_POLICIES:
@@ -400,7 +447,8 @@ async def reconcile_project_retention(plan: str) -> None:
         plan = "basic"
     days = PLAN_POLICIES[plan]["retention_days"]
     now = datetime.now(timezone.utc)
-    projects = await db.projects.find({"user_id": USER_ID}, {"_id": 0}).to_list(10000)
+    # Deployment-wide sweep across all clients' projects (see purge_expired_projects).
+    projects = await db.projects.find({}, {"_id": 0}).to_list(10000)
     for project in projects:
         created_at = _parse_project_expiry(project.get("created_at")) or now
         expires_at = created_at + timedelta(days=days) if days is not None else None
@@ -492,7 +540,7 @@ def _clean_training_principles(values: List[str]) -> List[str]:
 async def _training_context(profile_id: Optional[str]) -> tuple[Optional[Dict[str, Any]], str]:
     if not profile_id:
         return None, ""
-    profile = await db.training_profiles.find_one({"id": profile_id, "user_id": USER_ID}, {"_id": 0})
+    profile = await db.training_profiles.find_one({"id": profile_id, "user_id": current_user_id()}, {"_id": 0})
     if not profile:
         raise HTTPException(404, "Training profile not found")
     if profile.get("status") != "active":
@@ -644,8 +692,8 @@ async def stripe_webhook(request: Request):
 # ---------- TRAINING LAB ----------
 @api.get("/training/dashboard")
 async def training_dashboard():
-    references = await db.training_references.find({"user_id": USER_ID}, {"_id": 0}).sort("created_at", -1).to_list(100)
-    profiles = await db.training_profiles.find({"user_id": USER_ID}, {"_id": 0}).sort("updated_at", -1).to_list(100)
+    references = await db.training_references.find({"user_id": current_user_id()}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    profiles = await db.training_profiles.find({"user_id": current_user_id()}, {"_id": 0}).sort("updated_at", -1).to_list(100)
     return {
         "policy": "References are editorial research and annotations, not uploaded creator footage or model fine-tuning data.",
         "references": references,
@@ -666,7 +714,7 @@ async def create_training_reference(body: TrainingReferenceBody):
             raise HTTPException(400, "Reference link must be a valid http(s) URL")
     principles = _clean_training_principles(body.principles)
     record = {
-        "id": f"ref_{uuid.uuid4().hex[:12]}", "user_id": USER_ID,
+        "id": f"ref_{uuid.uuid4().hex[:12]}", "user_id": current_user_id(),
         "title": body.title.strip(), "source_url": body.source_url.strip() if body.source_url else None,
         "niche": body.niche.strip().lower(), "game": body.game.strip() if body.game else None,
         "rights_status": body.rights_status, "notes": body.notes.strip(), "principles": principles,
@@ -682,7 +730,7 @@ async def create_training_profile(body: TrainingProfileBody):
     reference_ids = list(dict.fromkeys(body.reference_ids))
     valid_references = []
     for ref_id in reference_ids:
-        reference = await db.training_references.find_one({"id": ref_id, "user_id": USER_ID}, {"_id": 0})
+        reference = await db.training_references.find_one({"id": ref_id, "user_id": current_user_id()}, {"_id": 0})
         if not reference:
             raise HTTPException(400, "One or more selected references no longer exist")
         valid_references.append(reference)
@@ -695,7 +743,7 @@ async def create_training_profile(body: TrainingProfileBody):
     if not principles:
         raise HTTPException(400, "Add at least one usable editorial principle")
     record = {
-        "id": f"profile_{uuid.uuid4().hex[:12]}", "user_id": USER_ID,
+        "id": f"profile_{uuid.uuid4().hex[:12]}", "user_id": current_user_id(),
         "name": body.name.strip(), "niche": body.niche.strip().lower(), "game": body.game.strip() if body.game else None,
         "base_profile": body.base_profile, "reference_ids": reference_ids, "principles": principles,
         "reference_count": len(valid_references), "status": "draft",
@@ -707,12 +755,12 @@ async def create_training_profile(body: TrainingProfileBody):
 
 @api.post("/training/profiles/{profile_id}/activate")
 async def activate_training_profile(profile_id: str):
-    profile = await db.training_profiles.find_one({"id": profile_id, "user_id": USER_ID}, {"_id": 0})
+    profile = await db.training_profiles.find_one({"id": profile_id, "user_id": current_user_id()}, {"_id": 0})
     if not profile:
         raise HTTPException(404, "Training profile not found")
     if len(profile.get("principles", [])) < 3:
         raise HTTPException(400, "Add at least 3 approved principles before activation")
-    await db.training_profiles.update_one({"id": profile_id, "user_id": USER_ID}, {"$set": {
+    await db.training_profiles.update_one({"id": profile_id, "user_id": current_user_id()}, {"$set": {
         "status": "active", "activated_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }})
@@ -741,7 +789,7 @@ async def upload_project(file: UploadFile = File(...)):
     plan, expires_at = project_retention()
     project = {
         "id": pid,
-        "user_id": USER_ID,
+        "user_id": current_user_id(),
         "name": file.filename or f"Project-{pid[:8]}",
         "status": "uploaded",
         "status_message": "Uploaded, ready to analyze",
@@ -770,7 +818,7 @@ async def upload_project(file: UploadFile = File(...)):
 @api.get("/projects")
 async def list_projects():
     items = await db.projects.find(
-        {"user_id": USER_ID},
+        {"user_id": current_user_id()},
         {"_id": 0, "transcript.words": 0, "transcript.segments": 0},
     ).sort("created_at", -1).to_list(100)
     return items
@@ -924,7 +972,7 @@ async def upload_finalize(upload_id: str):
     plan, expires_at = project_retention()
     project = {
         "id": pid,
-        "user_id": USER_ID,
+        "user_id": current_user_id(),
         "name": m.get("filename") or f"Project-{pid[:8]}",
         "status": "uploaded",
         "status_message": "Uploaded, ready to analyze",
@@ -965,16 +1013,20 @@ async def save_edit_options(pid: str, options: EditOptions):
 
 @api.delete("/projects/{pid}")
 async def delete_project(pid: str):
-    doc = await db.projects.find_one({"id": pid})
+    doc = await db.projects.find_one({"id": pid, "user_id": current_user_id()})
     if not doc:
         raise HTTPException(404)
     _remove_project_files(doc)
-    await db.projects.delete_one({"id": pid})
+    await db.projects.delete_one({"id": pid, "user_id": current_user_id()})
     return {"ok": True}
 
 
 # ---------- ANALYZE PIPELINE ----------
-async def _run_analysis(pid: str):
+async def _run_analysis(pid: str, user_id: str):
+    # Background tasks run after the request context ends, so the per-client
+    # contextvar must be re-bound here from the value captured at dispatch time;
+    # otherwise get_project/update_project would target the wrong bucket.
+    _current_user_id.set(user_id)
     try:
         keys = await get_keys()
         if not keys.get("groq"):
@@ -1147,7 +1199,7 @@ async def analyze(pid: str, bg: BackgroundTasks, body: Optional[AnalyzeBody] = N
         pid, status="queued", status_message="Queued for analysis...", progress=1,
         requested_profile=body.requested_profile, training_profile_id=body.training_profile_id,
     )
-    bg.add_task(_run_analysis, pid)
+    bg.add_task(_run_analysis, pid, current_user_id())
     return {"ok": True, "status": "queued"}
 
 
@@ -1391,7 +1443,10 @@ async def viral_clips(pid: str):
 
 
 # ---------- RENDER PIPELINE ----------
-async def _run_render(pid: str, opts: RenderOptions):
+async def _run_render(pid: str, opts: RenderOptions, user_id: str):
+    # Re-bind the per-client contextvar for this post-response background task
+    # (see _run_analysis) so all project reads/writes stay scoped to the caller.
+    _current_user_id.set(user_id)
     try:
         proj = await get_project(pid)
         await update_project(pid, status="rendering", progress=5,
@@ -1561,7 +1616,7 @@ async def render(pid: str, opts: RenderOptions, bg: BackgroundTasks):
         raise HTTPException(400, "Clip end exceeds the source duration")
     await update_project(pid, status="queued_render",
                          status_message="Render queued...", progress=1)
-    bg.add_task(_run_render, pid, opts)
+    bg.add_task(_run_render, pid, opts, current_user_id())
     return {"ok": True, "status": "queued_render"}
 
 
@@ -1619,7 +1674,7 @@ async def media_output(pid: str):
 
 
 # ---------- APP WIRING ----------
-register_premium_routes(api, db, USER_ID, get_project, update_project, require_plan)
+register_premium_routes(api, db, current_user_id, get_project, update_project, require_plan)
 app.include_router(api)
 cors_origins = [origin.strip() for origin in os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",") if origin.strip()]
 app.add_middleware(
