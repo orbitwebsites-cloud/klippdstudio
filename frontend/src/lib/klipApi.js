@@ -34,19 +34,54 @@ export const getClientId = () => {
     }
 };
 
+// Real accounts are provided by Clerk. When a publishable key is configured the
+// app runs in authenticated mode: requests carry the Clerk session JWT and data
+// is scoped to the Clerk user id. Without a key we keep the anonymous
+// per-browser isolation mode so local dev and self-hosting work unchanged.
+export const clerkEnabled = () => Boolean(process.env.REACT_APP_CLERK_PUBLISHABLE_KEY);
+
+// ClerkProvider exposes the active session on window.Clerk. klipApi is not a
+// React component, so we read the token from there rather than via a hook.
+const clerkSessionToken = async () => {
+    try {
+        if (window.Clerk?.session) return await window.Clerk.session.getToken();
+    } catch { /* not signed in yet / Clerk still loading */ }
+    return null;
+};
+
 const api = axios.create({ baseURL: API, timeout: 60000 });
 
-// Attach the client identity to every API request so the backend scopes data
-// to this browser. Media/download URLs (loaded as <video src>, etc.) cannot
-// carry headers, so those helpers append a `client` query parameter instead.
-api.interceptors.request.use((config) => {
+// Attach identity to every API request: the Clerk session JWT when signed in,
+// otherwise the anonymous per-browser client id. Media/download URLs are loaded
+// as <video src> etc. and cannot carry headers, so those helpers append a
+// credential to the query string instead (see withMediaCredential).
+api.interceptors.request.use(async (config) => {
     config.headers = config.headers || {};
-    config.headers["X-Klippd-Client"] = getClientId();
+    if (clerkEnabled()) {
+        const token = await clerkSessionToken();
+        if (token) config.headers["Authorization"] = `Bearer ${token}`;
+    } else {
+        config.headers["X-Klippd-Client"] = getClientId();
+    }
     return config;
 });
 
-const withClient = (url) => {
+// Cached media token (see refreshMediaToken). Read synchronously by the media
+// URL helpers, which are called during render.
+let mediaTokenCache = null;
+export const refreshMediaToken = async () => {
+    const { data } = await api.get("/media-token");
+    mediaTokenCache = data?.token || null;
+    return mediaTokenCache;
+};
+export const clearMediaToken = () => { mediaTokenCache = null; };
+
+const withMediaCredential = (url, mediaToken) => {
     const sep = url.includes("?") ? "&" : "?";
+    if (clerkEnabled()) {
+        const token = mediaToken || mediaTokenCache;
+        return token ? `${url}${sep}mt=${encodeURIComponent(token)}` : url;
+    }
     return `${url}${sep}client=${encodeURIComponent(getClientId())}`;
 };
 
@@ -254,13 +289,15 @@ export const getSubscription = () => api.get("/subscription").then((r) => r.data
 export const createCheckout = (plan) => api.post("/billing/checkout", { plan }).then((r) => r.data);
 export const createBillingPortal = () => api.post("/billing/portal").then((r) => r.data);
 
-export const mediaOriginal = (id) => withClient(`${API}/media/original/${id}`);
-export const mediaOutput = (id) => withClient(`${API}/media/output/${id}`);
-export const mediaClip = (id, label) => withClient(`${API}/media/clip/${id}/${encodeURIComponent(label)}`);
+// The optional `mediaToken` argument lets callers pass the token from a hook so
+// the URL updates (and the media element reloads) as soon as the token is ready.
+export const mediaOriginal = (id, mediaToken) => withMediaCredential(`${API}/media/original/${id}`, mediaToken);
+export const mediaOutput = (id, mediaToken) => withMediaCredential(`${API}/media/output/${id}`, mediaToken);
+export const mediaClip = (id, label, mediaToken) => withMediaCredential(`${API}/media/clip/${id}/${encodeURIComponent(label)}`, mediaToken);
 export const mediaThumbnail = () => null;
-export const downloadUrl = (id, clipLabel) =>
+export const downloadUrl = (id, clipLabel, mediaToken) =>
     clipLabel
-        ? withClient(`${API}/projects/${id}/download?clip=${encodeURIComponent(clipLabel)}`)
-        : withClient(`${API}/projects/${id}/download`);
+        ? withMediaCredential(`${API}/projects/${id}/download?clip=${encodeURIComponent(clipLabel)}`, mediaToken)
+        : withMediaCredential(`${API}/projects/${id}/download`, mediaToken);
 
 export default api;

@@ -35,6 +35,7 @@ import stripe
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
+import auth
 import ai_services as ai
 import asset_generator
 from asset_pack_manager import AssetPackManager, AssetPolicyError, sha256_file
@@ -81,6 +82,24 @@ def _master_key() -> bytes:
 
 
 cipher = Fernet(_master_key())
+
+# Media/download URLs are loaded directly by the browser (<video src>, download
+# links) and cannot carry an Authorization header. For those we mint a
+# short-lived, user-scoped media token: the owner's data-isolation key sealed
+# with the server cipher. It is long-lived enough to survive video seeking
+# (range requests) but expires on its own, unlike the session JWT (~60s).
+MEDIA_TOKEN_TTL_SECONDS = int(os.environ.get("MEDIA_TOKEN_TTL_SECONDS", str(12 * 3600)))
+
+
+def issue_media_token(user_id: str) -> str:
+    return cipher.encrypt(user_id.encode()).decode()
+
+
+def verify_media_token(token: str) -> Optional[str]:
+    try:
+        return cipher.decrypt(token.encode(), ttl=MEDIA_TOKEN_TTL_SECONDS).decode()
+    except Exception:
+        return None
 
 MAX_VIDEO_BYTES = int(os.environ.get("MAX_VIDEO_BYTES", str(2 * 1024 * 1024 * 1024)))
 MAX_ASSET_BYTES = int(os.environ.get("MAX_ASSET_BYTES", str(500 * 1024 * 1024)))
@@ -154,16 +173,58 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 logger = logging.getLogger("backend")
 
-async def bind_current_user(request: Request) -> str:
-    """Resolve the per-client data-isolation key from the request.
+# API paths reachable without a signed-in user. Everything else requires auth
+# once Clerk is configured. Billing state is deployment-level, not per-user, so
+# it stays public; health is the liveness probe; the webhook is Stripe-signed.
+PUBLIC_API_PATHS = {"/api/health", "/api/billing/webhook", "/api/subscription"}
 
-    The client id normally arrives in a header, but media/download URLs are
-    loaded directly by the browser (e.g. <video src>) and cannot carry custom
-    headers, so a `client` query parameter is accepted as a fallback.
+
+def _bearer_token(request: Request) -> str:
+    header = request.headers.get("authorization", "")
+    if header.lower().startswith("bearer "):
+        return header[7:].strip()
+    return ""
+
+
+async def bind_current_user(request: Request) -> str:
+    """Resolve the data-isolation key for the request and store it in a contextvar.
 
     Runs as a router dependency so the contextvar is set inside each request's
     task before the endpoint body (and helpers like get_project) execute.
+
+    With Clerk configured, identity comes from the verified session JWT
+    (`Authorization: Bearer`), or a server-signed media token (`?mt=`) for
+    browser-loaded media URLs that cannot send headers. Without a valid
+    credential, public paths resolve to the deployment bucket and everything
+    else returns 401.
+
+    Without Clerk (local dev / self-host) the app falls back to anonymous
+    per-browser isolation via the X-Klippd-Client header or `client` query param.
     """
+    if auth.clerk_enabled():
+        media_token = request.query_params.get("mt", "")
+        if media_token:
+            owner = verify_media_token(media_token)
+            if owner:
+                _current_user_id.set(owner)
+                return owner
+
+        token = _bearer_token(request)
+        if token:
+            try:
+                sub = auth.verify_session_token(token)
+            except auth.AuthError:
+                sub = ""
+            if sub:
+                user_id = f"user_{sub}"
+                _current_user_id.set(user_id)
+                return user_id
+
+        if request.url.path in PUBLIC_API_PATHS:
+            _current_user_id.set(USER_ID)
+            return USER_ID
+        raise HTTPException(401, "Authentication required")
+
     raw = request.headers.get(CLIENT_ID_HEADER, "") or request.query_params.get("client", "")
     user_id = _client_to_user_id(raw)
     _current_user_id.set(user_id)
@@ -182,8 +243,13 @@ if STRIPE_SECRET_KEY:
 
 @app.middleware("http")
 async def optional_access_token(request: Request, call_next):
-    """Optional MVP gate; leave unset locally and protect public deployments."""
-    if APP_ACCESS_TOKEN and request.method != "OPTIONS" and request.url.path not in {"/api/health", "/api/billing/webhook"}:
+    """Optional MVP gate; leave unset locally and protect public deployments.
+
+    Superseded by Clerk when it is configured: with real per-user auth the
+    shared static token is redundant (and its Bearer header now carries the
+    Clerk JWT instead), so skip it.
+    """
+    if APP_ACCESS_TOKEN and not auth.clerk_enabled() and request.method != "OPTIONS" and request.url.path not in {"/api/health", "/api/billing/webhook"}:
         bearer = request.headers.get("authorization", "")
         supplied = request.headers.get("x-app-token", "")
         if bearer.lower().startswith("bearer "):
@@ -1621,6 +1687,20 @@ async def render(pid: str, opts: RenderOptions, bg: BackgroundTasks):
 
 
 # ---------- MEDIA ----------
+@api.get("/media-token")
+async def media_token():
+    """Issue a short-lived token the browser appends to media/download URLs.
+
+    Requires an authenticated request (the router dependency has already
+    resolved the caller); the token simply re-encodes that identity for URLs
+    that cannot send an Authorization header.
+    """
+    return {
+        "token": issue_media_token(current_user_id()),
+        "expires_in": MEDIA_TOKEN_TTL_SECONDS,
+    }
+
+
 def _clean_filename(name: str) -> str:
     """Strip original extension and unsafe chars so downloads are always .mp4"""
     stem = os.path.splitext(name or "video")[0]

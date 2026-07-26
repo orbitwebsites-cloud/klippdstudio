@@ -22,6 +22,7 @@ import {
     analyzeProject,
     apiErrorMessage,
 } from "@/lib/klipApi";
+import { useSignedIn } from "@/hooks/useSignedIn";
 
 const FEATURES = [
     { icon: Scissors, title: "Kill filler words", copy: "Um. Uh. Stutters. All gone." },
@@ -54,24 +55,35 @@ export default function Landing({ backendOnline }) {
     const [projectsError, setProjectsError] = useState(false);
     const inputRef = useRef();
 
+    const { signedIn } = useSignedIn();
+
     const refresh = useCallback(() => {
+        if (!signedIn) return;
         listProjects()
             .then((items) => {
                 setProjects(items);
                 setProjectsError(false);
             })
             .catch(() => setProjectsError(true));
-    }, []);
+    }, [signedIn]);
 
     useEffect(() => {
+        if (!signedIn) {
+            setProjects([]);
+            return undefined;
+        }
         refresh();
         // Poll to update processing statuses
         const t = setInterval(refresh, 4000);
         return () => clearInterval(t);
-    }, [refresh]);
+    }, [refresh, signedIn]);
 
     const handleFile = async (file) => {
         if (!file) return;
+        if (!signedIn) {
+            toast.error("Please sign in to upload and edit videos.");
+            return;
+        }
         if (backendOnline === false) {
             toast.error("The Klipped Studio server is offline. Try again once it is connected.");
             return;

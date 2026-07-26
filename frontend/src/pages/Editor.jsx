@@ -24,6 +24,7 @@ import {
 import LibraryPanel from "@/components/LibraryPanel";
 import CreatorProfilesPanel from "@/components/CreatorProfilesPanel";
 import EditChatPanel from "@/components/EditChatPanel";
+import { useMediaToken } from "@/hooks/useMediaToken";
 import {
     API,
     getProject,
@@ -61,6 +62,7 @@ export default function Editor() {
     const { id } = useParams();
     const navigate = useNavigate();
     const location = useLocation();
+    const mediaToken = useMediaToken();
     const [project, setProject] = useState(null);
     const projectId = project?.id;
     const projectStatus = project?.status;
@@ -455,7 +457,7 @@ export default function Editor() {
                     <div className="panel">
                         <video
                             ref={videoRef}
-                            src={hasMainOutput ? mediaOutput(project.id) : mediaOriginal(project.id)}
+                            src={hasMainOutput ? mediaOutput(project.id, mediaToken) : mediaOriginal(project.id, mediaToken)}
                             controls
                             className="w-full aspect-video bg-black"
                             onTimeUpdate={(e) => setCurrentTime(e.target.currentTime)}
@@ -467,7 +469,7 @@ export default function Editor() {
                                     ✓ EDITED VERSION LOADED
                                 </div>
                                 <a
-                                    href={downloadUrl(project.id)}
+                                    href={downloadUrl(project.id, undefined, mediaToken)}
                                     className="btn-brand"
                                     data-testid="download-btn"
                                     download
@@ -855,14 +857,14 @@ export default function Editor() {
                                         {rendered ? (
                                             <div className="mt-4 space-y-2">
                                                 <video
-                                                    src={mediaClip(id, label)}
+                                                    src={mediaClip(id, label, mediaToken)}
                                                     controls
                                                     className="w-full bg-black"
                                                     style={{ aspectRatio: "9/16", maxHeight: 400 }}
                                                     data-testid={`viral-video-${idx}`}
                                                 />
                                                 <a
-                                                    href={downloadUrl(id, label)}
+                                                    href={downloadUrl(id, label, mediaToken)}
                                                     download
                                                     className="btn-brand w-full !justify-center !text-xs !py-2"
                                                     data-testid={`viral-download-${idx}`}

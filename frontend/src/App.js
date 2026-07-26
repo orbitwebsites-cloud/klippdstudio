@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useState } from "react";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { Toaster } from "sonner";
 import TopBar from "@/components/TopBar";
+import AuthGate from "@/components/AuthGate";
 import Landing from "@/pages/Landing";
 import { getHealth } from "@/lib/klipApi";
 import "@/App.css";
@@ -33,10 +34,10 @@ function App() {
                     <Landing backendOnline={backendOnline} />
                 } />
                 <Route path="/project/:id" element={
-                    <Suspense fallback={<RouteLoading />}><Editor /></Suspense>
+                    <AuthGate><Suspense fallback={<RouteLoading />}><Editor /></Suspense></AuthGate>
                 } />
                 <Route path="/training" element={
-                    <Suspense fallback={<RouteLoading />}><TrainingLab /></Suspense>
+                    <AuthGate><Suspense fallback={<RouteLoading />}><TrainingLab /></Suspense></AuthGate>
                 } />
                 <Route path="/pricing" element={
                     <Suspense fallback={<RouteLoading />}><Pricing /></Suspense>

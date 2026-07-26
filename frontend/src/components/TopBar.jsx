@@ -1,5 +1,29 @@
 import { Link } from "react-router-dom";
 import { Sparkles, WifiOff, BrainCircuit } from "lucide-react";
+import { SignedIn, SignedOut, SignInButton, UserButton } from "@clerk/clerk-react";
+import { clerkEnabled } from "@/lib/klipApi";
+
+function AuthControls() {
+    if (!clerkEnabled()) return null;
+    return (
+        <>
+            <SignedOut>
+                <SignInButton mode="modal">
+                    <button
+                        type="button"
+                        className="text-xs font-mono tracking-wider text-black bg-[#ccff00] px-3 py-1.5 hover:opacity-90"
+                        data-testid="sign-in-btn"
+                    >
+                        SIGN IN
+                    </button>
+                </SignInButton>
+            </SignedOut>
+            <SignedIn>
+                <UserButton afterSignOutUrl="/" />
+            </SignedIn>
+        </>
+    );
+}
 
 export default function TopBar({ backendOnline }) {
     return (
@@ -37,6 +61,7 @@ export default function TopBar({ backendOnline }) {
                             <WifiOff className="w-3.5 h-3.5" /> SERVER OFFLINE
                         </div>
                     )}
+                    <AuthControls />
                 </div>
             </div>
         </header>
