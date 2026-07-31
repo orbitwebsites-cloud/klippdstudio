@@ -262,6 +262,7 @@ def test_render_uses_only_checksum_registered_assets(api_env, monkeypatch):
             "provenance": "direct_user_upload",
             "niche": "gaming",
             "is_evidence": True,
+            "owner": server.USER_ID,
         },
         {"max_files": 10, "max_file_bytes": 1024 * 1024, "max_total_bytes": 10 * 1024 * 1024},
         audit_sample_rate=0,

@@ -383,6 +383,9 @@ class AssetPackManager:
             "status": "published", "niche": entry.get("niche", "gaming"), "is_evidence": bool(entry.get("is_evidence", False)),
             "tags": sorted({str(tag).lower() for tag in entry.get("tags", []) if str(tag).strip()}),
             "malware_scan": scan,
+            # Owner of a user-uploaded asset (None for shared stock packs). Used
+            # to keep one user's uploads out of every other user's library.
+            "owner": entry.get("owner"),
         }
         return self._save_record(record)
 
@@ -420,6 +423,13 @@ class AssetPackManager:
         for record in index["assets"].values():
             if self._record_bytes_are_current(record):
                 yield record
+
+    def record_for(self, name: str) -> Optional[Dict[str, Any]]:
+        """Return the current published record for a file name, if any."""
+        record = self._index()["assets"].get(os.path.basename(name))
+        if record and self._record_bytes_are_current(record):
+            return record
+        return None
 
     def delete(self, name: str) -> bool:
         index = self._index()

@@ -9,14 +9,22 @@ parameter for URL-loaded media) only ever sees its own projects.
 from __future__ import annotations
 
 import asyncio
+import io
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from local_store import LocalDatabase
 import server
+
+
+def _png_bytes() -> bytes:
+    output = io.BytesIO()
+    Image.new("RGBA", (16, 16), (10, 120, 30, 255)).save(output, "PNG")
+    return output.getvalue()
 
 
 @pytest.fixture
@@ -82,6 +90,43 @@ def test_media_uses_client_query_param_fallback(api_env):
 
     stranger = api_env.client.get("/api/media/original/alice-project?client=bob")
     assert stranger.status_code == 404
+
+
+ATTESTATION = "I own or have commercial rights to this asset"
+
+
+def _upload_library_asset(env, client_id: str, filename: str) -> None:
+    resp = env.client.post(
+        "/api/library/upload",
+        headers={"X-Klippd-Client": client_id},
+        files={"file": (filename, _png_bytes(), "image/png")},
+        data={
+            "rights_status": "user_owned_attested",
+            "rights_attestation": ATTESTATION,
+            "license_id": "user-attestation-v1",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json().get("ok") is True, resp.text
+
+
+def test_library_is_scoped_to_the_uploading_client(api_env):
+    _upload_library_asset(api_env, "alice", "alice-clip.png")
+
+    alice = api_env.client.get("/api/library", headers={"X-Klippd-Client": "alice"}).json()["items"]
+    assert len(alice) == 1
+
+    # Bob must not see Alice's uploaded clip in his library "feed".
+    bob = api_env.client.get("/api/library", headers={"X-Klippd-Client": "bob"}).json()["items"]
+    assert bob == []
+
+
+def test_library_file_of_another_client_is_not_served(api_env):
+    _upload_library_asset(api_env, "alice", "alice-clip.png")
+    name = api_env.client.get("/api/library", headers={"X-Klippd-Client": "alice"}).json()["items"][0]["name"]
+
+    assert api_env.client.get(f"/api/library/file/{name}", headers={"X-Klippd-Client": "alice"}).status_code == 200
+    assert api_env.client.get(f"/api/library/file/{name}", headers={"X-Klippd-Client": "bob"}).status_code == 404
 
 
 def test_missing_client_id_falls_back_to_the_legacy_bucket(api_env):

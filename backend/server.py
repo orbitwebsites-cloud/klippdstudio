@@ -1282,11 +1282,29 @@ def _asset_kind(name: str) -> str:
     return "other"
 
 
+def _is_private_upload(record: Dict[str, Any]) -> bool:
+    """True for a user-uploaded asset (as opposed to a shared stock-pack asset)."""
+    return bool(record) and record.get("provenance") == "direct_user_upload"
+
+
+def _asset_readable_by_current_user(record: Optional[Dict[str, Any]]) -> bool:
+    """Shared stock assets are readable by anyone; a user's own uploads only by them."""
+    if not record:
+        return False
+    if _is_private_upload(record):
+        return record.get("owner") == current_user_id()
+    return True
+
+
 @api.get("/library")
 async def library_list():
-    """List all assets in the user's personal library."""
+    """List the current user's personal library (their own uploaded assets)."""
     items = []
     for record in ASSET_MANAGER.published_records():
+        # Only the signed-in user's own uploads belong in their personal library;
+        # shared stock-pack assets surface through B-roll search, not here.
+        if record.get("owner") != current_user_id():
+            continue
         p = LIBRARY_DIR / record["name"]
         aid = p.stem
         items.append({
@@ -1338,6 +1356,7 @@ async def library_upload(
         "provenance": "direct_user_upload", "attribution": "User supplied",
         "niche": "gaming", "is_evidence": attested,
         "tags": [token.lower() for token in re.findall(r"[A-Za-z0-9]+", stem)[:12]],
+        "owner": current_user_id(),
     }
     try:
         record = await asyncio.to_thread(
@@ -1356,6 +1375,11 @@ async def library_upload(
 async def library_delete(name: str):
     """Delete an asset from the library (safe against path traversal)."""
     safe = os.path.basename(name)
+    # A user can only delete their own uploaded assets, never shared stock or
+    # another user's uploads.
+    record = ASSET_MANAGER.record_for(safe)
+    if not record or record.get("owner") != current_user_id():
+        raise HTTPException(404)
     if not ASSET_MANAGER.delete(safe):
         raise HTTPException(404)
     return {"ok": True}
@@ -1365,6 +1389,9 @@ async def library_delete(name: str):
 async def library_file(name: str):
     """Serve a library file for preview."""
     safe = os.path.basename(name)
+    # Never serve another user's uploaded asset by guessing its name.
+    if not _asset_readable_by_current_user(ASSET_MANAGER.record_for(safe)):
+        raise HTTPException(404)
     p = ASSET_MANAGER.resolve_renderable(LIBRARY_DIR / safe)
     if not p:
         raise HTTPException(404)
@@ -1459,6 +1486,7 @@ async def broll_upload(
         "provenance": "direct_user_upload", "attribution": "User supplied",
         "niche": "gaming", "is_evidence": attested,
         "tags": [token.lower() for token in re.findall(r"[A-Za-z0-9]+", file.filename or "")[:12]],
+        "owner": current_user_id(),
     }
     try:
         record = await asyncio.to_thread(
@@ -1587,6 +1615,11 @@ async def _run_render(pid: str, opts: RenderOptions, user_id: str):
                 registered = ASSET_MANAGER.resolve_renderable(requested) if requested else None
                 if not registered:
                     logger.warning("Rejected unregistered, quarantined, remote, or forged asset for project %s", pid)
+                    continue
+                # A user may only render shared stock assets or their own uploads,
+                # never another user's private B-roll.
+                if not _asset_readable_by_current_user(ASSET_MANAGER.record_for(registered.name)):
+                    logger.warning("Rejected another user's private asset for project %s", pid)
                     continue
                 local = str(registered)
                 # Compute output time from word index remap
